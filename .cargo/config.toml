@@ -1,0 +1,7 @@
+# 16 KB page alignment for Android native libs (defense in depth;
+# scripts/check-16kb.ps1 is the authority).
+[target.aarch64-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+
+[target.x86_64-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]

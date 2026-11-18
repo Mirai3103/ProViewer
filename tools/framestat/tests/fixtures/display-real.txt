@@ -1,0 +1,11 @@
+    mActiveModeId=6
+      DisplayModeRecord{mMode={id=1, width=1272, height=2800, fps=120.00001, vsync=120.00001, synthetic=false, alternativeRefreshRates=[60.000004, 90.0, 144.00002, 165.0], }}
+      DisplayModeRecord{mMode={id=2, width=1272, height=2800, fps=60.000004, vsync=60.000004, synthetic=false, alternativeRefreshRates=[90.0, 120.00001, 144.00002, 165.0], }}
+      DisplayModeRecord{mMode={id=3, width=1272, height=2800, fps=90.0, vsync=90.0, synthetic=false, alternativeRefreshRates=[60.000004, 120.00001, 144.00002, 165.0], }}
+      DisplayModeRecord{mMode={id=4, width=1272, height=2800, fps=144.00002, vsync=144.00002, synthetic=false, alternativeRefreshRates=[60.000004, 90.0, 120.00001, 165.0], }}
+      DisplayModeRecord{mMode={id=5, width=1272, height=2800, fps=165.0, vsync=165.0, synthetic=false, alternativeRefreshRates=[60.000004, 90.0, 120.00001, 144.00002], }}
+      DisplayModeRecord{mMode={id=6, width=1080, height=2378, fps=120.00001, vsync=120.00001, synthetic=false, alternativeRefreshRates=[60.000004, 90.0, 144.00002, 165.0], }}
+      DisplayModeRecord{mMode={id=7, width=1080, height=2378, fps=60.000004, vsync=60.000004, synthetic=false, alternativeRefreshRates=[90.0, 120.00001, 144.00002, 165.0], }}
+      DisplayModeRecord{mMode={id=8, width=1080, height=2378, fps=90.0, vsync=90.0, synthetic=false, alternativeRefreshRates=[60.000004, 120.00001, 144.00002, 165.0], }}
+      DisplayModeRecord{mMode={id=9, width=1080, height=2378, fps=144.00002, vsync=144.00002, synthetic=false, alternativeRefreshRates=[60.000004, 90.0, 120.00001, 165.0], }}
+      DisplayModeRecord{mMode={id=10, width=1080, height=2378, fps=165.0, vsync=165.0, synthetic=false, alternativeRefreshRates=[60.000004, 90.0, 120.00001, 144.00002], }}

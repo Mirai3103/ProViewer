@@ -1,0 +1,6 @@
+Display Manager State (dumpsys display):
+  mActiveModeId=3
+  mSupportedModes=
+    DisplayModeRecord{mMode={id=1, width=1440, height=3168, fps=60.0, alternativeRefreshRates=[]}}
+    DisplayModeRecord{mMode={id=2, width=1440, height=3168, fps=120.0, alternativeRefreshRates=[]}}
+    DisplayModeRecord{mMode={id=3, width=1440, height=3168, fps=185.0, alternativeRefreshRates=[]}}

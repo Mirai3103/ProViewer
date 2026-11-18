@@ -1,0 +1,13 @@
+[package]
+name = "gen-corpus"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+anyhow = "1.0.104"
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
+zip = { version = "9.7.0", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

@@ -1,0 +1,244 @@
+{
+    "context": {
+        "build": {
+            "brand": "OnePlus",
+            "device": "OP612DL1",
+            "fingerprint": "OnePlus/CPH2767IN/OP612DL1:16/BP2A.250605.015/B.R4T3.3a1658b-172d9ef-176ba9e:user/release-keys",
+            "id": "BP2A.250605.015",
+            "model": "CPH2767",
+            "type": "user",
+            "version": {
+                "codename": "REL",
+                "sdk": 36
+            }
+        },
+        "cpuCoreCount": 8,
+        "cpuLocked": true,
+        "cpuMaxFreqHz": 3801600000,
+        "memTotalBytes": 11639062528,
+        "sustainedPerformanceModeEnabled": false,
+        "artMainlineVersion": 372042720,
+        "osCodenameAbbreviated": "REL",
+        "compilationMode": "run-from-apk",
+        "payload": {}
+    },
+    "benchmarks": [
+        {
+            "name": "startup",
+            "params": {},
+            "className": "com.proviewer.benchmark.StartupBenchmark",
+            "totalRunTimeNs": 394301526985,
+            "metrics": {
+                "frameCount": {
+                    "minimum": 3.0,
+                    "maximum": 3.0,
+                    "median": 3.0,
+                    "coefficientOfVariation": 0.0,
+                    "runs": [
+                        3.0,
+                        3.0,
+                        3.0,
+                        3.0,
+                        3.0,
+                        3.0,
+                        3.0,
+                        3.0,
+                        3.0,
+                        3.0
+                    ]
+                },
+                "timeToInitialDisplayMs": {
+                    "minimum": 153.789219,
+                    "maximum": 226.744375,
+                    "median": 170.045859,
+                    "coefficientOfVariation": 0.1219280396286769,
+                    "runs": [
+                        226.744375,
+                        153.789219,
+                        172.566823,
+                        185.228802,
+                        170.257239,
+                        169.834479,
+                        157.037604,
+                        158.576927,
+                        162.186198,
+                        174.028594
+                    ]
+                }
+            },
+            "sampledMetrics": {
+                "frameDurationCpuMs": {
+                    "P50": 2.545182,
+                    "P90": 61.3509741,
+                    "P95": 63.35752074999999,
+                    "P99": 71.22373048,
+                    "runs": [
+                        [
+                            73.914115,
+                            2.131666,
+                            1.051927
+                        ],
+                        [
+                            43.266927,
+                            2.535156,
+                            1.575781
+                        ],
+                        [
+                            58.73026,
+                            2.844114,
+                            1.283593
+                        ],
+                        [
+                            61.301771,
+                            2.725313,
+                            1.241094
+                        ],
+                        [
+                            61.017083,
+                            2.555208,
+                            1.283021
+                        ],
+                        [
+                            61.793802,
+                            2.208125,
+                            1.414167
+                        ],
+                        [
+                            56.921198,
+                            2.590781,
+                            1.381094
+                        ],
+                        [
+                            57.933958,
+                            3.094375,
+                            1.228229
+                        ],
+                        [
+                            64.636927,
+                            2.471927,
+                            1.439584
+                        ],
+                        [
+                            60.055417,
+                            2.19677,
+                            1.23375
+                        ]
+                    ]
+                },
+                "frameOverrunMs": {
+                    "P50": -8.987384,
+                    "P90": 74.1645642,
+                    "P95": 93.16516449999992,
+                    "P99": 113.56069927,
+                    "runs": [
+                        [
+                            117.358492,
+                            -10.719855,
+                            -11.968966
+                        ],
+                        [
+                            47.464823,
+                            -7.659207,
+                            -14.431693
+                        ],
+                        [
+                            73.172827,
+                            -6.554927,
+                            -14.69769
+                        ],
+                        [
+                            104.262655,
+                            -10.315561,
+                            -11.765153
+                        ],
+                        [
+                            73.560453,
+                            -10.464935,
+                            -11.749958
+                        ],
+                        [
+                            71.460107,
+                            -5.025553,
+                            -11.555927
+                        ],
+                        [
+                            56.829918,
+                            -7.111869,
+                            -14.559997
+                        ],
+                        [
+                            68.473065,
+                            -13.004979,
+                            -14.741143
+                        ],
+                        [
+                            58.177463,
+                            -14.057387,
+                            -14.573563
+                        ],
+                        [
+                            79.601565,
+                            -5.897961,
+                            -11.813066
+                        ]
+                    ]
+                }
+            },
+            "warmupIterations": 0,
+            "repeatIterations": 10,
+            "thermalThrottleSleepSeconds": 0,
+            "profilerOutputs": [
+                {
+                    "type": "PerfettoTrace",
+                    "label": "Trace Iteration 0",
+                    "filename": "StartupBenchmark_startup_iter000_2026-11-18-12-19-02.perfetto-trace"
+                },
+                {
+                    "type": "PerfettoTrace",
+                    "label": "Trace Iteration 1",
+                    "filename": "StartupBenchmark_startup_iter001_2026-11-18-12-19-43.perfetto-trace"
+                },
+                {
+                    "type": "PerfettoTrace",
+                    "label": "Trace Iteration 2",
+                    "filename": "StartupBenchmark_startup_iter002_2026-11-18-12-20-22.perfetto-trace"
+                },
+                {
+                    "type": "PerfettoTrace",
+                    "label": "Trace Iteration 3",
+                    "filename": "StartupBenchmark_startup_iter003_2026-11-18-12-21-01.perfetto-trace"
+                },
+                {
+                    "type": "PerfettoTrace",
+                    "label": "Trace Iteration 4",
+                    "filename": "StartupBenchmark_startup_iter004_2026-11-18-12-21-40.perfetto-trace"
+                },
+                {
+                    "type": "PerfettoTrace",
+                    "label": "Trace Iteration 5",
+                    "filename": "StartupBenchmark_startup_iter005_2026-11-18-12-22-19.perfetto-trace"
+                },
+                {
+                    "type": "PerfettoTrace",
+                    "label": "Trace Iteration 6",
+                    "filename": "StartupBenchmark_startup_iter006_2026-11-18-12-22-58.perfetto-trace"
+                },
+                {
+                    "type": "PerfettoTrace",
+                    "label": "Trace Iteration 7",
+                    "filename": "StartupBenchmark_startup_iter007_2026-11-18-12-23-37.perfetto-trace"
+                },
+                {
+                    "type": "PerfettoTrace",
+                    "label": "Trace Iteration 8",
+                    "filename": "StartupBenchmark_startup_iter008_2026-11-18-12-24-16.perfetto-trace"
+                },
+                {
+                    "type": "PerfettoTrace",
+                    "label": "Trace Iteration 9",
+                    "filename": "StartupBenchmark_startup_iter009_2026-11-18-12-24-56.perfetto-trace"
+                }
+            ]
+        }
+    ]
+}

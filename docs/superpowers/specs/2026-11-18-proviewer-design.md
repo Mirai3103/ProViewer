@@ -35,7 +35,7 @@ Build an Android comic/manga reader with the ambition of being a **"Perfect View
 - **RAR/CBR**: not in v1; license must be reviewed (`unrar` vs `libarchive`) before selling.
 - Dev environment: Windows 11. The Rust engine must be testable/benchmarkable on desktop, not only on-device.
 - The project uses **git** (owner approved `git init`; done). Commit only when the owner asks.
-- **Reference device (primary test device)**: Snapdragon 8 Elite, 12 GB RAM, Android 16, **185 Hz** display (frame budget ≈ 5.4 ms). Other configurations are tested on **emulator** only.
+- **Reference device (primary test device)**: OnePlus CPH2767 (SoC `SM8845`), ~11 GB usable RAM, Android 16, display locked to **120 Hz** (frame budget ≈ 8.3 ms; the panel supports up to 165 Hz, owner chose 120 Hz on 2026-11-18). Other configurations are tested on **emulator** only.
   - Emulator is adequate for **correctness** (runs, 16 KB, screen sizes, rotation/fold) but **not trustworthy for performance numbers**.
   - A flagship gives optimistic numbers; budgets for weaker devices come when scope expands.
 - **Language**: all specs and plans are written in **English**. (Conversation with the owner is in Vietnamese.)
@@ -72,7 +72,7 @@ Build an Android comic/manga reader with the ambition of being a **"Perfect View
 
 **Data path**: `uniffi` for control calls (few, small). Pixels travel on a separate path (Rust writes into a locked `Bitmap` via `AndroidBitmap_lockPixels`, or a direct `ByteBuffer`) to avoid serialization and extra copies. This means two FFI mechanisms coexist (uniffi/JNA for control, raw JNI for pixels); keep the JNI surface to a handful of functions.
 
-**Bitmap upload to the GPU**: a software `Bitmap` is uploaded on the RenderThread the first time it is drawn (a 1600×2400 RGBA page ≈ 15 MB). At 185 Hz (5.4 ms per frame) this is the most likely source of dropped frames on page turn. Phase 2 must measure and choose between: `Bitmap.prepareToDraw()` on prefetched pages (async upload), and `AHardwareBuffer` + `Bitmap.wrapHardwareBuffer` (API 29 = our minSdk; no separate upload). This is evaluated in Phase 2, not deferred to "later".
+**Bitmap upload to the GPU**: a software `Bitmap` is uploaded on the RenderThread the first time it is drawn (a 1600×2400 RGBA page ≈ 15 MB). At 120 Hz (8.3 ms per frame) this is the most likely source of dropped frames on page turn. Phase 2 must measure and choose between: `Bitmap.prepareToDraw()` on prefetched pages (async upload), and `AHardwareBuffer` + `Bitmap.wrapHardwareBuffer` (API 29 = our minSdk; no separate upload). This is evaluated in Phase 2, not deferred to "later".
 
 **Image quality**: resize on CPU (`fast_image_resize`, Lanczos or Area) to the exact screen size, then display 1:1. Resize in **linear light** (sRGB → linear → resize → sRGB): resizing gamma-encoded values darkens and shifts screentone, which is as visible as moiré. On zoom: temporarily show the existing bitmap, then re-render the visible region at the new scale once the gesture settles. This is the primary defense against moiré; default trilinear mipmaps are not used.
 
@@ -93,11 +93,11 @@ Build an Android comic/manga reader with the ambition of being a **"Perfect View
 
 A benchmark suite exists from Phase 0. Metrics:
 - Page turn → sharp image: first time (cold cache) and after prefetch.
-- Dropped frames during zoom/pan and Webtoon scrolling, at the device refresh rate (185 Hz on the reference device).
+- Dropped frames during zoom/pan and Webtoon scrolling, at the device refresh rate (120 Hz on the reference device).
 - Peak memory when reading many pages / very large images — **total process memory** (Rust cache + `Bitmap` pixels + GPU textures), not only the Rust cache budget.
 - Time to open a book (large CBZ).
 
-**Frame measurement method**: Perfetto **FrameTimeline** (`android.surfaceflinger.frametimeline`), analysed with `trace_processor`. Not `dumpsys gfxinfo framestats`, because: it only keeps the last ~120 frames (≈ 0.65 s at 185 Hz); it only sees HWUI-drawn frames (blind to SurfaceView/GL, e.g. a future `wgpu` renderer); and "frame duration > 1 vsync" is not jank on a pipelined renderer. A frame is janky when FrameTimeline marks a `jank_type` other than `None` / `Buffer Stuffing`. Budgets are stated as **janky-frame %**; frame-duration percentiles are reported for information only.
+**Frame measurement method**: Perfetto **FrameTimeline** (`android.surfaceflinger.frametimeline`), analysed with `trace_processor`. Not `dumpsys gfxinfo framestats`, because: it only keeps the last ~120 frames (≈ 1 s at 120 Hz); it only sees HWUI-drawn frames (blind to SurfaceView/GL, e.g. a future `wgpu` renderer); and "frame duration > 1 vsync" is not jank on a pipelined renderer. A frame is janky when FrameTimeline marks a `jank_type` other than `None` / `Buffer Stuffing`. Budgets are stated as **janky-frame %**; frame-duration percentiles are reported for information only.
 
 Concrete targets are **absolute** (no competitor baseline). They are proposed in Phase 0 as provisional numbers, approved by the owner, then used as completion criteria for later phases; a target is tightened when measurements show we can do better, never loosened silently. Starting proposals: janky frames ≤ 1 % per scenario at the locked max refresh rate; prefetched page turn < 100 ms, cold < 300 ms. Also needed: **a fixed test corpus** (manga with screentone, long Webtoon, very large images, double-page spreads).
 
@@ -125,7 +125,7 @@ Phases 0–1 deliberately have **no reader UI**; the purpose is to get real meas
 - **Play policy** on content and file permissions → stay on SAF, no pirate-source integration.
 - **JNI/uniffi complexity** → keep the control API small; keep the pixel path separate.
 - **Flagship-only measurement** → numbers are optimistic; emulator can't validate performance on weaker hardware (accepted for now, out of scope).
-- **GPU upload jank at 185 Hz** → see §5 "Bitmap upload"; measured in Phase 2.
+- **GPU upload jank at 120 Hz** → see §5 "Bitmap upload"; measured in Phase 2.
 - **Non-seekable SAF fds** → copy-to-cache fallback (§3).
 - **Malicious/corrupt files cause OOM abort** → input limits + fuzzing in Phase 1 (§5 "Untrusted input").
 - **Absolute budgets may be set too loose or too tight without a competitor reference** → mark provisional, tighten as soon as Phase 1–3 numbers exist; the owner approves every change.
@@ -137,7 +137,7 @@ Concrete API names; concrete crates (after comparison); module structure; tile s
 ## 11. Open questions
 
 Resolved (2026-11-18):
-1. Reference device: Snapdragon 8 Elite, 12 GB RAM, Android 16, 185 Hz (see section 3). Concrete budget numbers are still set in Phase 0 by measurement.
+1. Reference device: OnePlus CPH2767, ~11 GB RAM, Android 16, locked to 120 Hz (see section 3). Concrete budget numbers are still set in Phase 0 by measurement.
 2. `git init`: approved and done.
 3. Rust/NDK experience: owner is experienced → per-phase plans can be concise, with no foundational explanations.
 

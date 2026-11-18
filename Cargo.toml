@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = ["core", "tools/uniffi-bindgen", "tools/gen-corpus", "tools/framestat"]
+
+[workspace.dependencies]
+uniffi = "=0.32.2"
+
+[profile.release]
+# uniffi converts Rust panics into Kotlin exceptions only with unwinding.
+# Never switch this to "abort" (spec §5).
+panic = "unwind"

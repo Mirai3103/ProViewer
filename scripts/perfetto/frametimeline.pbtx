@@ -1,0 +1,20 @@
+# Perfetto text config: SurfaceFlinger FrameTimeline for the whole action.
+# {{DURATION_MS}} is substituted by scripts/perf-capture.ps1.
+buffers {
+  size_kb: 65536
+  fill_policy: RING_BUFFER
+}
+data_sources {
+  config {
+    name: "android.surfaceflinger.frametimeline"
+  }
+}
+data_sources {
+  config {
+    name: "linux.process_stats"
+    process_stats_config {
+      scan_all_processes_on_start: true
+    }
+  }
+}
+duration_ms: {{DURATION_MS}}

@@ -1,0 +1,10 @@
+target/
+build/
+.gradle/
+app/src/main/jniLibs/
+corpus/generated/
+corpus/local/
+.tools/
+docs/perf/traces/
+local.properties
+.superpowers/

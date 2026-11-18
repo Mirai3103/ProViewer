@@ -1,0 +1,2 @@
+    mActiveModeId=1
+      DisplayModeRecord{mMode={id=1, parentModeId=-1, sfModeId=0, flags=, width=1080, height=2400, fps=60.000004, vsync=60.000004, alternativeRefreshRates=[], supportedHdrTypes=[]}}

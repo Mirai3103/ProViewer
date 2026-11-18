@@ -1,0 +1,7 @@
+"ts","dur","jank_type","present_type","layer_name"
+1000000000,4800000,"None","On-time Present","TX - com.android.settings/.Settings#0"
+1005405405,5100000,"None","On-time Present","TX - com.android.settings/.Settings#0"
+1010810810,5300000,"Buffer Stuffing","On-time Present","TX - com.android.settings/.Settings#0"
+1016216216,12000000,"App Deadline Missed","Late Present","TX - com.android.settings/.Settings#0"
+1021621621,11000000,"App Deadline Missed, Buffer Stuffing","Late Present","TX - com.android.settings/.Settings#0"
+1027027027,4900000,"None","On-time Present","TX - com.android.settings/.Settings#0"
