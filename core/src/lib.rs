@@ -7,10 +7,14 @@ pub mod cache;
 pub mod decode;
 pub mod engine;
 pub mod error;
+pub mod handles;
 pub mod limits;
 pub mod natsort;
 pub mod resize;
 pub mod scheduler;
+
+#[cfg(target_os = "android")]
+pub mod android;
 
 /// Version of the engine crate, exposed to Kotlin as `engineVersion()`.
 #[uniffi::export]

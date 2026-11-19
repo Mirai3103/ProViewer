@@ -89,6 +89,13 @@ pub fn default_engine_config() -> EngineConfig {
     EngineConfig::default()
 }
 
+/// Unregisters a book handle previously returned by [`Book::native_handle`], returning whether it
+/// was still registered. Safe to call more than once (the second call returns `false`).
+#[uniffi::export]
+pub fn release_book_handle(handle: u64) -> bool {
+    crate::handles::BOOKS.remove(handle)
+}
+
 #[derive(uniffi::Record, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EngineStats {
     pub decodes: u64,
@@ -532,6 +539,14 @@ impl Book {
     /// Makes every queued or not-yet-started prefetch job of this book a no-op.
     pub fn cancel_prefetch(&self) {
         self.inner.generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Registers this book in the JNI handle registry and returns its non-zero handle. The JNI
+    /// pixel path (`NativePixels`) reaches the book through this handle, and
+    /// [`release_book_handle`] unregisters it; uniffi's internal object pointers must never be
+    /// relied on for this.
+    pub fn native_handle(self: Arc<Self>) -> u64 {
+        crate::handles::BOOKS.insert(self)
     }
 }
 

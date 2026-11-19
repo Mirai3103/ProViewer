@@ -20,6 +20,9 @@ fast_image_resize = { workspace = true }
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 libc = { workspace = true }
 
+[target.'cfg(target_os = "android")'.dependencies]
+jni = { workspace = true }
+
 [dev-dependencies]
 gen-corpus = { path = "../tools/gen-corpus" }
 tempfile = { workspace = true }

@@ -923,6 +923,7 @@ dependencies = [
  "image",
  "image-webp",
  "imagesize",
+ "jni",
  "jpeg-encoder",
  "libc",
  "png",
