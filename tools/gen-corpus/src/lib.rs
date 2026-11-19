@@ -201,6 +201,45 @@ pub fn generate_all(out_dir: &Path) -> Result<Vec<PathBuf>> {
     generate_with_scale(out_dir, 1.0)
 }
 
+/// Fuzz seed corpus: the small archives (scale 0.02) under `<out_dir>/archive/`, plus every image
+/// entry extracted from them as `<out_dir>/decode/<n>.<ext>`. `many-pages` and `webtoon-long` are
+/// skipped (many entries / very tall strips make poor, slow seeds).
+pub fn generate_fuzz_seeds(out_dir: &Path) -> Result<Vec<PathBuf>> {
+    use std::io::Read;
+    let archive_dir = out_dir.join("archive");
+    let decode_dir = out_dir.join("decode");
+    std::fs::create_dir_all(&decode_dir)?;
+    let mut written = Vec::new();
+    let mut n = 0usize;
+    for cbz in generate_with_scale(&archive_dir, 0.02)? {
+        let stem = cbz.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        if stem == "many-pages" || stem == "webtoon-long" {
+            std::fs::remove_file(&cbz)?;
+            continue;
+        }
+        let mut z = zip::ZipArchive::new(std::fs::File::open(&cbz)?)?;
+        for i in 0..z.len() {
+            let mut entry = z.by_index(i)?;
+            let name = String::from_utf8_lossy(entry.name_raw()).to_string();
+            if !is_image_name(&name) {
+                continue;
+            }
+            let ext = match name.rsplit('.').next().unwrap_or("").to_ascii_lowercase().as_str() {
+                "jpeg" => "jpg".to_string(),
+                other => other.to_string(),
+            };
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes)?;
+            let p = decode_dir.join(format!("{n}.{ext}"));
+            std::fs::write(&p, bytes)?;
+            written.push(p);
+            n += 1;
+        }
+        written.push(cbz);
+    }
+    Ok(written)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,6 +358,50 @@ mod tests {
         z.by_name("vol1/page10.webp").unwrap().read_to_end(&mut buf).unwrap();
         let img = image::load_from_memory_with_format(&buf, image::ImageFormat::WebP).unwrap();
         assert!(img.width() >= 1 && img.height() >= 1);
+    }
+
+    #[test]
+    fn fuzz_seeds_layout_and_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        generate_fuzz_seeds(dir.path()).unwrap();
+
+        let mut archives: Vec<String> = std::fs::read_dir(dir.path().join("archive"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        archives.sort();
+        assert_eq!(
+            archives,
+            vec![
+                "double-spread.cbz",
+                "formats-and-names.cbz",
+                "huge-single.cbz",
+                "mixed-small.cbz",
+                "screentone.cbz",
+            ]
+        );
+
+        // 6 + 1 + 4 + 20 + 4 image entries (ComicInfo.xml is not an image).
+        let mut images = 0;
+        let mut exts = std::collections::BTreeSet::new();
+        for e in std::fs::read_dir(dir.path().join("decode")).unwrap() {
+            let path = e.unwrap().path();
+            let stem = path.file_stem().unwrap().to_string_lossy().to_string();
+            assert!(stem.parse::<u32>().is_ok(), "seed name is <n>.<ext>: {path:?}");
+            let ext = path.extension().unwrap().to_string_lossy().to_string();
+            let bytes = std::fs::read(&path).unwrap();
+            let want = match ext.as_str() {
+                "jpg" => image::ImageFormat::Jpeg,
+                "png" => image::ImageFormat::Png,
+                "webp" => image::ImageFormat::WebP,
+                other => panic!("unexpected extension {other}"),
+            };
+            assert_eq!(image::guess_format(&bytes).unwrap(), want, "{path:?}");
+            exts.insert(ext);
+            images += 1;
+        }
+        assert_eq!(images, 35);
+        assert_eq!(exts.len(), 3, "jpg, png and webp seeds are all present");
     }
 
     #[test]

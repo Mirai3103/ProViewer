@@ -90,6 +90,22 @@ if (Test-Path $vswhere) {
 }
 Report ([bool]$linkExe) 'MSVC link.exe' $linkExe
 
+# --- CMake + Ninja (libjpeg-turbo is built from source by cargo; the SDK cmake package ships both) ---
+function Find-BuildTool([string]$exe) {
+    $c = Get-Command $exe -ErrorAction SilentlyContinue
+    if ($c) { return $c.Source }
+    if ($sdk -and (Test-Path "$sdk\cmake")) {
+        return Get-ChildItem "$sdk\cmake" -Directory |
+            Sort-Object { try { [version]$_.Name } catch { [version]'0.0' } } -Descending |
+            ForEach-Object { Join-Path $_.FullName "bin\$exe" } |
+            Where-Object { Test-Path $_ } | Select-Object -First 1
+    }
+}
+$cmakeExe = Find-BuildTool 'cmake.exe'
+Report ([bool]$cmakeExe) 'cmake' $cmakeExe
+$ninjaExe = Find-BuildTool 'ninja.exe'
+Report ([bool]$ninjaExe) 'ninja' $ninjaExe
+
 # --- Perfetto trace_processor_shell (pinned) ---
 $tp = Join-Path $repoRoot '.tools\trace_processor_shell.exe'
 $tpOk = $false; $tpVer = ''
@@ -105,6 +121,8 @@ if ($PassThru) {
         ZipAlign       = $zipAlign
         ReadElf        = $readElf
         Adb            = $(if ($adb) { $adb.Source })
+        Cmake          = $cmakeExe
+        Ninja          = $ninjaExe
         TraceProcessor = $tp
         Failed         = $script:failed
     }

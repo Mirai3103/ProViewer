@@ -1,0 +1,10 @@
+# Kotlin binding configuration.
+#
+# `EngineError` variants carry a `message` field. In Kotlin every error is a `kotlin.Exception`, whose own
+# `message` property then clashes with the generated field ("Conflicting declarations"). Only the Kotlin-side
+# name changes; the Rust field names and the FFI wire format are untouched.
+[bindings.kotlin.rename]
+"EngineError.Io.message" = "detail"
+"EngineError.UnsupportedFormat.message" = "detail"
+"EngineError.Corrupt.message" = "detail"
+"EngineError.InvalidRequest.message" = "detail"

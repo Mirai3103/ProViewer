@@ -1,6 +1,7 @@
 # ProViewer performance budgets
 
-Status: **approved by the owner on 2026-11-18** (Phase 0 exit gate). Rows c and d still need their numbers, set in Phase 1 and approved then. Absolute budgets; there is no competitor baseline
+Status: rows a1, a2, a3 and b were **approved by the owner on 2026-11-18** (Phase 0 exit gate). Rows c and d were
+**dropped by the owner on 2026-11-19** (see below). Absolute budgets; there is no competitor baseline
 (spec §1, §7). Measured on the reference device only (OnePlus CPH2767, ~11 GB, Android 16, 120 Hz,
 display locked to max refresh rate); the emulator is never used for performance numbers.
 A budget may be tightened with owner approval, never loosened silently.
@@ -21,8 +22,16 @@ the expected one before or after the run, or if the target package produced zero
 | a2 | Janky-frame % at locked 120 Hz | ≤ **1 %** | Paged swipe — `mixed-small.cbz` | `perf-capture.ps1 -Action paged-swipe` | Phase 2 | approved |
 | a3 | Janky-frame % at locked 120 Hz | ≤ **1 %** | Pinch-zoom + pan — `screentone.cbz`, `huge-single.cbz` | `perf-capture.ps1 -Action manual` (owner gestures) | Phase 2 | approved |
 | b | Page turn → sharp image | prefetched **< 100 ms**, cold **< 300 ms** | Page turns on `mixed-small.cbz` | Method decided in Phase 2 when the reader exists (frame timing cannot measure it) | Phase 2 | approved |
-| c | Peak total process PSS (Rust cache + Bitmaps + GPU) | proposed in Phase 1 from the engine's measured cache + decode footprint | `huge-single.cbz`, `webtoon-long.cbz` | `peak_pss_kb` column of `perf-capture.ps1` (max of ~1 Hz `dumpsys meminfo` samples) | Phase 2 | approved rule; number TBD |
-| d | Open time of a 500-page archive | set in Phase 1 from bench numbers | `many-pages.cbz` | Phase 1 criterion bench | Phase 1 | approved rule; number TBD |
+| c | Peak total process PSS | **dropped, no number** | n/a | n/a | n/a | dropped by owner decision 2026-11-19 |
+| d | Open time of a 500-page archive | **dropped, no number** | n/a | n/a | n/a | dropped by owner decision 2026-11-19 |
+
+**Rows c and d: dropped by owner decision 2026-11-19** ("bỏ hết đi, ko có được đo benmark gì hết trên máy thật"). No engine
+budget numbers are proposed for peak process PSS (c) or open time of a 500-page archive (d), and no formulas are needed.
+Nothing was measured for them. Rows a1, a2, a3 and b are untouched and remain approved.
+
+**Open conflict (owner decision needed later, not changed here):** a1, a2, a3 and b are defined as reference-device
+measurements (`perf-capture.ps1` on the OnePlus, see Method). The owner's 2026-11-19 instruction that no benchmarks run on the
+real device conflicts with them for Phase 2 and Phase 3, where they are enforced. How, or whether, they will be verified is open.
 
 Frame-duration percentiles (p50/p90/p95/p99) are recorded for information only, **not** budgeted:
 a pipelined renderer legitimately has frames longer than one vsync.

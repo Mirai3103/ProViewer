@@ -9,8 +9,23 @@ crate-type = ["cdylib", "lib"]
 
 [dependencies]
 uniffi = { workspace = true }
+thiserror = { workspace = true }
+zip = { workspace = true }
+turbojpeg = { workspace = true }
+png = { workspace = true }
+image-webp = { workspace = true }
+imagesize = { workspace = true }
+fast_image_resize = { workspace = true }
+
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+libc = { workspace = true }
 
 [dev-dependencies]
+gen-corpus = { path = "../tools/gen-corpus" }
+tempfile = { workspace = true }
+image = { workspace = true }
+jpeg-encoder = { workspace = true }
+proptest = "=1.12.0"
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 
 [[bench]]

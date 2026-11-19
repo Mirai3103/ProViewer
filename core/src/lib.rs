@@ -1,6 +1,16 @@
-//! ProViewer engine. Phase 0: only a version export to prove the uniffi toolchain.
+//! ProViewer engine: archive and image decoding, tile rendering, caching and prefetch, exported over uniffi.
 
 uniffi::setup_scaffolding!();
+
+pub mod archive;
+pub mod cache;
+pub mod decode;
+pub mod engine;
+pub mod error;
+pub mod limits;
+pub mod natsort;
+pub mod resize;
+pub mod scheduler;
 
 /// Version of the engine crate, exposed to Kotlin as `engineVersion()`.
 #[uniffi::export]

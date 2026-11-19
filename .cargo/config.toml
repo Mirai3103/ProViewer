@@ -5,3 +5,8 @@ rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
 
 [target.x86_64-linux-android]
 rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+
+# Host (Windows) builds of C dependencies: make libjpeg-turbo use the dynamic MSVC runtime like Rust does.
+# Android targets are unaffected (the variable is target-specific).
+[env]
+CMAKE_TOOLCHAIN_FILE_x86_64_pc_windows_msvc = { value = "cmake/msvc-crt-dll.cmake", relative = true }

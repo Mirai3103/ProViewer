@@ -8,3 +8,12 @@ corpus/local/
 docs/perf/traces/
 local.properties
 .superpowers/
+
+# codec-bench inputs exported for the :codecbench platform benchmark (already under build/; explicit for clarity)
+codecbench/build/codec-inputs/
+
+# cargo-fuzz output (Cargo.lock of the fuzz crate is committed)
+core/fuzz/artifacts/
+core/fuzz/corpus/
+core/fuzz/corpus-seeds/
+core/fuzz/target/

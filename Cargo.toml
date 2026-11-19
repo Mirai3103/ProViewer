@@ -1,9 +1,31 @@
 [workspace]
 resolver = "2"
-members = ["core", "tools/uniffi-bindgen", "tools/gen-corpus", "tools/framestat"]
+members = ["core", "tools/uniffi-bindgen", "tools/gen-corpus", "tools/framestat", "tools/codec-bench", "tools/pvcli"]
+# Needs nightly + Linux (cargo-fuzz in the WSL distro `proviewer`); has its own Cargo.lock.
+exclude = ["core/fuzz"]
 
 [workspace.dependencies]
 uniffi = "=0.32.2"
+thiserror = "=2.0.21"
+zip = { version = "=9.7.0", default-features = false, features = ["deflate"] }
+image = { version = "=0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
+tempfile = "=3.27.0"
+# JPEG codec candidates (Task 3 comparison). turbojpeg is the chosen backend (used by core); the others stay for codec-bench.
+zune-jpeg = "=0.5.15"
+zune-core = "=0.5.3"
+jpeg-decoder = { version = "=0.3.2", default-features = false }
+jpeg-encoder = "=0.7.1"
+# libjpeg-turbo built from source by CMake. `require-simd` (a default feature) is off: it makes the x86_64 build
+# fail without NASM. arm64 uses NEON without NASM; x86 targets fall back to the C code.
+turbojpeg = { version = "=1.5.1", default-features = false, features = ["cmake"] }
+png = "=0.18.1"
+image-webp = "=0.2.4"
+imagesize = "=0.15.0"
+fast_image_resize = "=6.1.0"
+# Prefetch worker priority (setpriority/gettid) on Linux and Android only.
+libc = "=0.2.191"
+# pvcli peak working set on Windows (K32GetProcessMemoryInfo). Minimal features only.
+windows-sys = { version = "=0.61.2", default-features = false, features = ["Win32_System_ProcessStatus", "Win32_System_Threading"] }
 
 [profile.release]
 # uniffi converts Rust panics into Kotlin exceptions only with unwinding.

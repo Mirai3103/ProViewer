@@ -3,6 +3,8 @@
 Captured 2026-11-18 over adb from the owner's device. Emulator results are never used for performance
 numbers (spec §3).
 
+No Phase 1 engine benchmarks were run on this device: owner decision 2026-11-19 ("bỏ hết đi, ko có được đo benmark gì hết trên máy thật").
+
 ## Owner decision (2026-11-18): reference refresh rate is 120 Hz
 
 The spec and plan assumed a 185 Hz display. The attached device supports 60 / 90 / 120 / 144 / 165 Hz. The owner

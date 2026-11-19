@@ -1,0 +1,32 @@
+[package]
+name = "proviewer_core-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# Standalone workspace root (cargo-fuzz template). core/fuzz is also listed in the root `exclude`.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+proviewer_core = { path = ".." }
+
+[[bin]]
+name = "archive"
+path = "fuzz_targets/archive.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1

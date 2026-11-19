@@ -23,3 +23,4 @@ dependencyResolutionManagement {
 rootProject.name = "ProViewer"
 include(":app")
 include(":benchmark")
+include(":codecbench")
