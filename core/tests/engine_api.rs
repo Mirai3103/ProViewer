@@ -38,6 +38,12 @@ fn open(engine: &Engine, name: &str) -> Arc<Book> {
     engine.open_path(corpus_path(name)).unwrap()
 }
 
+fn open_file(engine: &Engine, name: &str) -> Arc<Book> {
+    let path = common::small_corpus().join(name);
+    let file = std::fs::File::open(&path).unwrap();
+    engine.open_file(file).unwrap()
+}
+
 /// Polls `cond` until it holds. Panics after 5 s. Never used as a plain delay.
 fn wait_until(what: &str, cond: impl Fn() -> bool) {
     let deadline = Instant::now() + TIMEOUT;
@@ -186,6 +192,37 @@ fn default_config_matches_spec() {
     assert_eq!(c.prefetch_behind, 1);
     assert_eq!(c.worker_threads, 2);
     assert_eq!(c.limits, Limits::default());
+}
+
+#[test]
+fn open_file_opens_cbz() {
+    let engine = engine();
+    let path_book = open(&engine, "mixed-small.cbz");
+    let file_book = open_file(&engine, "mixed-small.cbz");
+    assert_eq!(file_book.page_count(), 20);
+    assert_eq!(file_book.page_count(), path_book.page_count());
+    for i in 0..file_book.page_count() {
+        assert_eq!(
+            file_book.page_name(i).unwrap(),
+            path_book.page_name(i).unwrap()
+        );
+    }
+}
+
+#[test]
+fn open_file_rejects_text() {
+    let engine = engine();
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("notes.txt");
+    std::fs::write(&p, b"definitely not a zip").unwrap();
+    let file = std::fs::File::open(&p).unwrap();
+    assert!(
+        matches!(
+            engine.open_file(file),
+            Err(EngineError::UnsupportedFormat { ref message }) if message.contains("file")
+        ),
+        "expected UnsupportedFormat containing label"
+    );
 }
 
 #[test]

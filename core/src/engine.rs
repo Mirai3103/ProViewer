@@ -56,6 +56,9 @@ use crate::error::{EngineError, Result};
 use crate::limits::Limits;
 use crate::resize::{choose_denom, render_region, Rect};
 use crate::scheduler::PrefetchPool;
+use std::fs::File;
+#[cfg(unix)]
+use std::os::unix::io::FromRawFd;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
@@ -211,24 +214,34 @@ impl Engine {
 
     /// Opens a folder or a ZIP/CBZ file. Every book gets a unique id and shares the engine's cache budget.
     pub fn open_path(&self, path: String) -> Result<Arc<Book>> {
-        let source = open_path(Path::new(&path), self.core.limits)?;
-        let count = source.pages().len();
-        let id = self.next_book_id.fetch_add(1, Ordering::Relaxed);
-        let inner = Arc::new(BookInner {
-            id,
-            core: Arc::clone(&self.core),
-            infos: Mutex::new(vec![None; count]),
-            decode_counts: (0..count).map(|_| AtomicU64::new(0)).collect(),
-            source,
-            generation: AtomicU64::new(0),
-            closed: AtomicBool::new(false),
-        });
-        Ok(Arc::new(Book {
-            inner,
-            pool: Arc::clone(&self.pool),
-            prefetch_ahead: self.config.prefetch_ahead,
-            prefetch_behind: self.config.prefetch_behind,
-        }))
+        Ok(self.book_from_source(open_path(Path::new(&path), self.core.limits)?))
+    }
+
+    /// Opens a book from a Unix file descriptor. Exported on every platform so Kotlin bindings stay present.
+    pub fn open_fd(&self, fd: i32) -> Result<Arc<Book>> {
+        #[cfg(unix)]
+        {
+            let file = unsafe { File::from_raw_fd(fd) };
+            let pos = unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) };
+            if pos < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::ESPIPE) {
+                    drop(file);
+                    return Err(EngineError::NotSeekable);
+                }
+                return Err(EngineError::Io {
+                    message: err.to_string(),
+                });
+            }
+            self.open_file(file)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = fd;
+            Err(EngineError::UnsupportedFormat {
+                message: "open_fd needs a unix file descriptor".to_string(),
+            })
+        }
     }
 
     pub fn stats(&self) -> EngineStats {
@@ -241,8 +254,34 @@ impl Engine {
     }
 }
 
-/// Rust-only diagnostics, used by tests.
+/// Rust-only API (not exported over uniffi).
 impl Engine {
+    /// Builds a `Book` from an already opened page source. Shared by `open_path` and `open_file`.
+    fn book_from_source(&self, source: Arc<dyn PageSource>) -> Arc<Book> {
+        let count = source.pages().len();
+        let id = self.next_book_id.fetch_add(1, Ordering::Relaxed);
+        let inner = Arc::new(BookInner {
+            id,
+            core: Arc::clone(&self.core),
+            infos: Mutex::new(vec![None; count]),
+            decode_counts: (0..count).map(|_| AtomicU64::new(0)).collect(),
+            source,
+            generation: AtomicU64::new(0),
+            closed: AtomicBool::new(false),
+        });
+        Arc::new(Book {
+            inner,
+            pool: Arc::clone(&self.pool),
+            prefetch_ahead: self.config.prefetch_ahead,
+            prefetch_behind: self.config.prefetch_behind,
+        })
+    }
+
+    /// Opens a ZIP/CBZ file from an already-owned `File`.
+    pub fn open_file(&self, file: File) -> Result<Arc<Book>> {
+        Ok(self.book_from_source(crate::archive::open_file(file, "file", self.core.limits)?))
+    }
+
     /// Prefetch jobs that were queued and have neither finished nor been discarded.
     #[doc(hidden)]
     pub fn pending_prefetch_jobs(&self) -> usize {
@@ -629,5 +668,18 @@ mod tests {
     #[test]
     fn targets_handle_current_beyond_the_end() {
         assert!(prefetch_targets(u32::MAX, ReadDirection::Forward, 10, 3, 3).is_empty());
+    }
+
+    #[test]
+    #[cfg(not(unix))]
+    fn open_fd_is_unsupported_off_unix() {
+        let engine = Engine::new(EngineConfig::default());
+        assert!(
+            matches!(
+                engine.open_fd(0),
+                Err(EngineError::UnsupportedFormat { ref message }) if message.contains("open_fd needs a unix file descriptor")
+            ),
+            "expected UnsupportedFormat on non-unix"
+        );
     }
 }

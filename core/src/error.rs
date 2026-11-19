@@ -19,6 +19,8 @@ pub enum EngineError {
     InvalidRequest { message: String },
     #[error("cancelled")]
     Cancelled,
+    #[error("file descriptor is not seekable")]
+    NotSeekable,
 }
 
 impl From<std::io::Error> for EngineError {
@@ -43,5 +45,13 @@ mod tests {
             EngineError::Io { message } => assert!(message.contains('x')),
             other => panic!("expected Io, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn not_seekable_display() {
+        assert_eq!(
+            EngineError::NotSeekable.to_string(),
+            "file descriptor is not seekable"
+        );
     }
 }

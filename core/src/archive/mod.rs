@@ -129,24 +129,25 @@ fn page_at(entries: &[PageEntry], page: usize) -> Result<&PageEntry> {
     })
 }
 
-/// Opens a directory, or a ZIP/CBZ file recognised by its magic bytes (not its extension).
-pub fn open_path(path: &Path, limits: Limits) -> Result<Arc<dyn PageSource>> {
-    if path.is_dir() {
-        return Ok(Arc::new(FolderSource::open(path, limits)?));
-    }
-    let mut file = File::open(path)?;
+/// Opens a file (already owned by the caller) recognised by its magic bytes as a ZIP/CBZ archive.
+pub fn open_file(mut file: File, label: &str, limits: Limits) -> Result<Arc<dyn PageSource>> {
     let mut magic = Vec::with_capacity(4);
     (&mut file).take(4).read_to_end(&mut magic)?;
     if magic == ZIP_LOCAL_MAGIC || magic == ZIP_EMPTY_MAGIC {
         Ok(Arc::new(ZipSource::from_reader(file, limits)?))
     } else {
         Err(EngineError::UnsupportedFormat {
-            message: format!(
-                "{} is neither a folder nor a ZIP/CBZ archive",
-                path.display()
-            ),
+            message: format!("{} is neither a folder nor a ZIP/CBZ archive", label),
         })
     }
+}
+
+/// Opens a directory, or a ZIP/CBZ file recognised by its magic bytes (not its extension).
+pub fn open_path(path: &Path, limits: Limits) -> Result<Arc<dyn PageSource>> {
+    if path.is_dir() {
+        return Ok(Arc::new(FolderSource::open(path, limits)?));
+    }
+    open_file(File::open(path)?, &path.display().to_string(), limits)
 }
 
 #[cfg(test)]
