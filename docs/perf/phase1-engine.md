@@ -123,10 +123,13 @@ owner decision 2026-11-19), so nothing here is confirmed or refuted.
 
 ## Known limitations / decisions pending
 
-- **I3: libjpeg warnings are fatal (owner decision pending).** `turbojpeg-rs` treats a libjpeg warning as an error, which
-  surfaces as `Corrupt`. Recoverable files (extraneous bytes before a marker, premature end of data) are therefore
-  rejected instead of showing a partial page, which is what many readers do. Whether to keep rejecting or to tolerate
-  warnings is an owner decision; it stays open and is the first item for Phase 2.
+- **I3: libjpeg warnings are fatal — resolved by owner decision D3 (2026-11-19).** libjpeg-turbo reports a recoverable
+  warning (extraneous bytes before a marker, premature end of data) as a `-1` return with `TJERR_WARNING`; the Phase 1
+  `turbojpeg-rs` wrapper turned every `-1` into `Corrupt`, so such files showed an error page instead of their decodable
+  part. The owner decided (D3) to tolerate warnings, and the decode backend now goes straight to the `tj3` API
+  (`turbojpeg::raw`) with `TJPARAM_STOPONWARNING = 0` and `TJPARAM_SCANLIMIT = 256`, treating a `-1` whose
+  `tj3GetErrorCode` is `TJERR_WARNING` as success and `TJERR_FATAL` as `Corrupt`. Implemented in Task 2; fuzz evidence
+  for the new path comes in Task 11.
 - **Fuzz coverage caveats.** The decode harness uses 4 MP / 16 K limits, so the 100 MP default limit and the
   progressive/multi-scan source-pixel cap path are not fuzzed at default scale. The seeds lack progressive, CMYK, 16-bit
   PNG, alpha and lossy WebP files. The libjpeg-turbo C code is not ASAN-instrumented, so memory errors inside it may

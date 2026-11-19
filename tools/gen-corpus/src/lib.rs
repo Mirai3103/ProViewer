@@ -237,7 +237,53 @@ pub fn generate_fuzz_seeds(out_dir: &Path) -> Result<Vec<PathBuf>> {
         }
         written.push(cbz);
     }
+
+    // Two damaged forms of the first JPEG seed become the next decode seeds, so the fuzzer also
+    // exercises the libjpeg-warning tolerance (Phase 2, owner decision D3).
+    let first_jpeg = std::fs::read(decode_dir.join("0.jpg"))?;
+    for damaged in [
+        truncate_mid_scan(&first_jpeg, 0.6),
+        insert_extraneous_before_sos(&first_jpeg),
+    ] {
+        let p = decode_dir.join(format!("{n}.jpg"));
+        std::fs::write(&p, damaged)?;
+        written.push(p);
+        n += 1;
+    }
     Ok(written)
+}
+
+/// Offset of the first start-of-scan (`FF DA`) marker, or `None` if it is absent.
+fn first_sos_offset(jpeg: &[u8]) -> Option<usize> {
+    jpeg.windows(2).position(|w| w == [0xFF, 0xDA])
+}
+
+/// Byte offset just past the first SOS segment (marker plus its parameters); the entropy-coded
+/// data begins here. The 2-byte length after the marker includes the length bytes themselves.
+fn sos_segment_end(jpeg: &[u8], sos: usize) -> usize {
+    let len = u16::from_be_bytes([jpeg[sos + 2], jpeg[sos + 3]]) as usize;
+    sos + 2 + len
+}
+
+/// Keep every byte up to the end of the first SOS segment plus `keep` (0..1) of the entropy-coded
+/// data, with no EOI. libjpeg decodes the rows it still has and reports a recoverable warning.
+pub fn truncate_mid_scan(jpeg: &[u8], keep: f32) -> Vec<u8> {
+    let sos = first_sos_offset(jpeg).expect("JPEG must contain an SOS marker");
+    let end = sos_segment_end(jpeg, sos);
+    let entropy = jpeg.len().saturating_sub(end);
+    let keep_bytes = ((entropy as f32) * keep.clamp(0.0, 1.0)) as usize;
+    jpeg[..end + keep_bytes].to_vec()
+}
+
+/// Insert the stray bytes `12 34` immediately before the first SOS marker. libjpeg treats them as
+/// "extraneous bytes before marker" (a recoverable warning) and then decodes the whole image.
+pub fn insert_extraneous_before_sos(jpeg: &[u8]) -> Vec<u8> {
+    let sos = first_sos_offset(jpeg).expect("JPEG must contain an SOS marker");
+    let mut out = Vec::with_capacity(jpeg.len() + 2);
+    out.extend_from_slice(&jpeg[..sos]);
+    out.extend_from_slice(&[0x12, 0x34]);
+    out.extend_from_slice(&jpeg[sos..]);
+    out
 }
 
 #[cfg(test)]
@@ -400,8 +446,30 @@ mod tests {
             exts.insert(ext);
             images += 1;
         }
-        assert_eq!(images, 35);
+        // 35 extracted image entries plus the two damaged JPEG forms of the first seed.
+        assert_eq!(images, 37);
         assert_eq!(exts.len(), 3, "jpg, png and webp seeds are all present");
+    }
+
+    #[test]
+    fn damaged_helpers_shape() {
+        let clean = encode_jpeg(&GrayImage::from_pixel(32, 32, Luma([128]))).unwrap();
+
+        let truncated = truncate_mid_scan(&clean, 0.6);
+        assert!(truncated.len() < clean.len(), "truncated JPEG must be shorter");
+        assert!(
+            !truncated.windows(2).any(|w| w == [0xFF, 0xD9]),
+            "truncated JPEG must not end with EOI"
+        );
+        assert!(
+            truncated.windows(2).any(|w| w == [0xFF, 0xDA]),
+            "truncated JPEG must keep its SOS marker"
+        );
+
+        let extraneous = insert_extraneous_before_sos(&clean);
+        assert_eq!(extraneous.len(), clean.len() + 2);
+        let sos = first_sos_offset(&extraneous).unwrap();
+        assert_eq!(&extraneous[sos - 2..sos], &[0x12, 0x34]);
     }
 
     #[test]
