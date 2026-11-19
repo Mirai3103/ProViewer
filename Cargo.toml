@@ -1,12 +1,15 @@
 [workspace]
 resolver = "2"
-members = ["core", "tools/uniffi-bindgen", "tools/gen-corpus", "tools/framestat", "tools/codec-bench", "tools/pvcli"]
+members = ["core", "tools/uniffi-bindgen", "tools/gen-corpus", "tools/bench-corpus", "tools/framestat", "tools/codec-bench", "tools/pvcli"]
 # Needs nightly + Linux (cargo-fuzz in the WSL distro `proviewer`); has its own Cargo.lock.
 exclude = ["core/fuzz"]
 
 [workspace.dependencies]
 uniffi = "=0.32.2"
 thiserror = "=2.0.21"
+# JNI bindings for the Android targets only (used by bench-corpus now, and by the core pixel
+# path in Task 4). Pinned exactly; read the 0.22 API before touching signatures.
+jni = "=0.22.4"
 zip = { version = "=9.7.0", default-features = false, features = ["deflate"] }
 image = { version = "=0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
 tempfile = "=3.27.0"

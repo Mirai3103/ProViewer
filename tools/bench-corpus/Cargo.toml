@@ -1,0 +1,13 @@
+[package]
+name = "bench-corpus"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "proviewer_benchgen"
+crate-type = ["cdylib"]
+
+[dependencies]
+gen-corpus = { path = "../gen-corpus" }
+jni = { workspace = true }

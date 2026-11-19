@@ -3,7 +3,7 @@
 //! No RNG is used anywhere: every pixel is a pure function of its coordinates and the
 //! arguments, so generated archives are byte-for-byte reproducible.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use image::codecs::jpeg::JpegEncoder;
 use image::codecs::png::PngEncoder;
 use image::codecs::webp::WebPEncoder;
@@ -128,72 +128,111 @@ fn numbered(i: usize, ext: &str) -> String {
     format!("{:03}.{}", i + 1, ext)
 }
 
+/// All seven corpus archive names, in generation order (see `corpus/README.md`).
+pub const ALL_CORPUS_NAMES: &[&str] = &[
+    "screentone.cbz",
+    "webtoon-long.cbz",
+    "huge-single.cbz",
+    "double-spread.cbz",
+    "mixed-small.cbz",
+    "many-pages.cbz",
+    "formats-and-names.cbz",
+];
+
+/// This crate's `CARGO_PKG_VERSION`, surfaced to the on-device generator stamp.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Build the entries for a single named corpus archive. The name must be one of
+/// [`ALL_CORPUS_NAMES`]; anything else is an error. Pixel dimensions are multiplied by `scale`
+/// (minimum 1 px); entry counts and names do not depend on `scale`.
+fn archive_entries(name: &str, scale: f32) -> Result<Vec<(String, Vec<u8>)>> {
+    let entries = match name {
+        // screentone.cbz: 6 pages, periods 2.0..=6.0
+        "screentone.cbz" => {
+            let mut e = Vec::new();
+            for i in 0..6usize {
+                let period = 2.0 + 0.8 * i as f32;
+                let page = halftone_page(sc(1600, scale), sc(2400, scale), period, 15.0 * i as f32 + 45.0);
+                e.push((numbered(i, "jpg"), encode_jpeg(&page)?));
+            }
+            e
+        }
+        // webtoon-long.cbz: 3 strips
+        "webtoon-long.cbz" => {
+            let mut e = Vec::new();
+            for i in 0..3usize {
+                e.push((numbered(i, "jpg"), encode_jpeg(&webtoon_strip(sc(800, scale), sc(24000, scale)))?));
+            }
+            e
+        }
+        // huge-single.cbz
+        "huge-single.cbz" => {
+            let huge = halftone_page(sc(12000, scale), sc(8000, scale), 4.0, 45.0);
+            vec![(numbered(0, "jpg"), encode_jpeg(&huge)?)]
+        }
+        // double-spread.cbz: portrait, spread, portrait, spread (PNG)
+        "double-spread.cbz" => {
+            let portrait = |i: u32| simple_page(sc(1600, scale), sc(2400, scale), i);
+            let spread = |i: u32| simple_page(sc(3200, scale), sc(2400, scale), i);
+            vec![
+                (numbered(0, "jpg"), encode_jpeg(&portrait(0))?),
+                (numbered(1, "jpg"), encode_jpeg(&spread(1))?),
+                (numbered(2, "jpg"), encode_jpeg(&portrait(2))?),
+                (numbered(3, "png"), encode_png(&spread(3))?),
+            ]
+        }
+        // mixed-small.cbz: 20 pages
+        "mixed-small.cbz" => {
+            let mut e = Vec::with_capacity(20);
+            for i in 0..20usize {
+                let page = simple_page(sc(800, scale), sc(1200, scale), i as u32);
+                e.push((numbered(i, "jpg"), encode_jpeg(&page)?));
+            }
+            e
+        }
+        // many-pages.cbz: 500 pages
+        "many-pages.cbz" => {
+            let mut e = Vec::with_capacity(500);
+            for i in 0..500usize {
+                let page = simple_page(sc(800, scale), sc(1200, scale), i as u32);
+                e.push((numbered(i, "jpg"), encode_jpeg(&page)?));
+            }
+            e
+        }
+        // formats-and-names.cbz
+        "formats-and-names.cbz" => {
+            let small = |i: u32| simple_page(sc(400, scale), sc(600, scale), i);
+            let comic_info = b"<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<ComicInfo><Title>ProViewer synthetic corpus</Title><PageCount>4</PageCount></ComicInfo>\n".to_vec();
+            vec![
+                ("ComicInfo.xml".to_string(), comic_info),
+                ("vol1/page10.webp".to_string(), encode_webp_lossless(&small(10))?),
+                ("vol1/page2.png".to_string(), encode_png(&small(2))?),
+                ("vol1/page1.jpg".to_string(), encode_jpeg(&small(1))?),
+                ("第3話.jpg".to_string(), encode_jpeg(&small(3))?),
+            ]
+        }
+        other => bail!("unknown corpus file: {other}"),
+    };
+    Ok(entries)
+}
+
+/// Generate only the named archives (from [`ALL_CORPUS_NAMES`]) with all pixel dimensions
+/// multiplied by `scale`. An unknown name is an error.
+pub fn generate_named(out_dir: &Path, scale: f32, names: &[&str]) -> Result<Vec<PathBuf>> {
+    std::fs::create_dir_all(out_dir)?;
+    let mut written = Vec::new();
+    for name in names {
+        let p = out_dir.join(name);
+        write_cbz(&p, &archive_entries(name, scale)?)?;
+        written.push(p);
+    }
+    Ok(written)
+}
+
 /// Generate the seven corpus archives with all pixel dimensions multiplied by `scale`
 /// (minimum 1 px). Entry counts and names do not depend on `scale`.
 pub fn generate_with_scale(out_dir: &Path, scale: f32) -> Result<Vec<PathBuf>> {
-    std::fs::create_dir_all(out_dir)?;
-    let mut written = Vec::new();
-    let mut emit = |name: &str, entries: Vec<(String, Vec<u8>)>| -> Result<()> {
-        let p = out_dir.join(name);
-        write_cbz(&p, &entries)?;
-        written.push(p);
-        Ok(())
-    };
-
-    // screentone.cbz: 6 pages, periods 2.0..=6.0
-    let mut e = Vec::new();
-    for i in 0..6usize {
-        let period = 2.0 + 0.8 * i as f32;
-        let page = halftone_page(sc(1600, scale), sc(2400, scale), period, 15.0 * i as f32 + 45.0);
-        e.push((numbered(i, "jpg"), encode_jpeg(&page)?));
-    }
-    emit("screentone.cbz", e)?;
-
-    // webtoon-long.cbz: 3 strips
-    let mut e = Vec::new();
-    for i in 0..3usize {
-        e.push((numbered(i, "jpg"), encode_jpeg(&webtoon_strip(sc(800, scale), sc(24000, scale)))?));
-    }
-    emit("webtoon-long.cbz", e)?;
-
-    // huge-single.cbz
-    let huge = halftone_page(sc(12000, scale), sc(8000, scale), 4.0, 45.0);
-    emit("huge-single.cbz", vec![(numbered(0, "jpg"), encode_jpeg(&huge)?)])?;
-
-    // double-spread.cbz: portrait, spread, portrait, spread (PNG)
-    let portrait = |i: u32| simple_page(sc(1600, scale), sc(2400, scale), i);
-    let spread = |i: u32| simple_page(sc(3200, scale), sc(2400, scale), i);
-    let e = vec![
-        (numbered(0, "jpg"), encode_jpeg(&portrait(0))?),
-        (numbered(1, "jpg"), encode_jpeg(&spread(1))?),
-        (numbered(2, "jpg"), encode_jpeg(&portrait(2))?),
-        (numbered(3, "png"), encode_png(&spread(3))?),
-    ];
-    emit("double-spread.cbz", e)?;
-
-    // mixed-small.cbz and many-pages.cbz
-    for (file, n) in [("mixed-small.cbz", 20usize), ("many-pages.cbz", 500usize)] {
-        let mut e = Vec::with_capacity(n);
-        for i in 0..n {
-            let page = simple_page(sc(800, scale), sc(1200, scale), i as u32);
-            e.push((numbered(i, "jpg"), encode_jpeg(&page)?));
-        }
-        emit(file, e)?;
-    }
-
-    // formats-and-names.cbz
-    let small = |i: u32| simple_page(sc(400, scale), sc(600, scale), i);
-    let comic_info = b"<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<ComicInfo><Title>ProViewer synthetic corpus</Title><PageCount>4</PageCount></ComicInfo>\n".to_vec();
-    let e = vec![
-        ("ComicInfo.xml".to_string(), comic_info),
-        ("vol1/page10.webp".to_string(), encode_webp_lossless(&small(10))?),
-        ("vol1/page2.png".to_string(), encode_png(&small(2))?),
-        ("vol1/page1.jpg".to_string(), encode_jpeg(&small(1))?),
-        ("第3話.jpg".to_string(), encode_jpeg(&small(3))?),
-    ];
-    emit("formats-and-names.cbz", e)?;
-
-    Ok(written)
+    generate_named(out_dir, scale, ALL_CORPUS_NAMES)
 }
 
 /// Full-size corpus (`scale` 1.0).
@@ -404,6 +443,25 @@ mod tests {
         z.by_name("vol1/page10.webp").unwrap().read_to_end(&mut buf).unwrap();
         let img = image::load_from_memory_with_format(&buf, image::ImageFormat::WebP).unwrap();
         assert!(img.width() >= 1 && img.height() >= 1);
+    }
+
+    #[test]
+    fn generate_named_matches_full_generation() {
+        let named_dir = tempfile::tempdir().unwrap();
+        let full_dir = tempfile::tempdir().unwrap();
+        generate_named(named_dir.path(), 0.05, &["mixed-small.cbz"]).unwrap();
+        generate_with_scale(full_dir.path(), 0.05).unwrap();
+        let named = std::fs::read(named_dir.path().join("mixed-small.cbz")).unwrap();
+        let full = std::fs::read(full_dir.path().join("mixed-small.cbz")).unwrap();
+        assert_eq!(named, full);
+    }
+
+    #[test]
+    fn generate_named_rejects_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = generate_named(dir.path(), 0.05, &["does-not-exist.cbz"]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("does-not-exist.cbz"), "message was: {msg}");
     }
 
     #[test]

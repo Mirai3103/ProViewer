@@ -7,6 +7,12 @@ val repoRoot = rootProject.projectDir
 val uniffiOut = layout.buildDirectory.dir("generated/uniffi/kotlin")
 val psArgs = listOf("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File")
 
+// Bench-only corpus generator (debug + benchmark build types). The release build type compiles
+// the `nobench` stub source set instead and never packages libproviewer_benchgen.so.
+val benchKotlinDir = layout.projectDirectory.dir("src/bench/kotlin")
+val benchJniLibsDir = layout.buildDirectory.dir("benchJniLibs")
+val nobenchKotlinDir = layout.projectDirectory.dir("src/nobench/kotlin")
+
 // Always regenerate bindings and rebuild the native library so a stale .so or
 // stale Kotlin bindings can never reach the APK (plan Review Focus 1).
 val genBindings by tasks.registering(Exec::class) {
@@ -20,6 +26,7 @@ val buildCore by tasks.registering(Exec::class) {
     workingDir = repoRoot
     commandLine(psArgs + listOf("scripts/build-core.ps1", "-Profile", "release"))
     outputs.dir(layout.projectDirectory.dir("src/main/jniLibs"))
+    outputs.dir(benchJniLibsDir)
     outputs.upToDateWhen { false }
 }
 
@@ -60,6 +67,20 @@ android {
 
     sourceSets.getByName("main") {
         kotlin.directories.add(uniffiOut.get().asFile.absolutePath)
+    }
+    // Bench code (CorpusGenerator + VariantFeatures) and the bench-only .so are compiled into
+    // the debug and benchmark build types only.
+    sourceSets.getByName("debug") {
+        kotlin.directories.add(benchKotlinDir.asFile.absolutePath)
+        jniLibs.directories.add(benchJniLibsDir.get().asFile.absolutePath)
+    }
+    sourceSets.getByName("benchmark") {
+        kotlin.directories.add(benchKotlinDir.asFile.absolutePath)
+        jniLibs.directories.add(benchJniLibsDir.get().asFile.absolutePath)
+    }
+    // The release build type gets the no-benchmark stub instead.
+    sourceSets.getByName("release") {
+        kotlin.directories.add(nobenchKotlinDir.asFile.absolutePath)
     }
 }
 
