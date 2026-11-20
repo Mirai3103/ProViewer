@@ -4,6 +4,16 @@ plugins {
 }
 
 val repoRoot = rootProject.projectDir
+
+// Short commit hash baked into every benchmark result; "unknown" when git is unavailable.
+val gitSha: String = runCatching {
+    val exec = providers.exec {
+        workingDir = repoRoot
+        commandLine("git", "rev-parse", "--short", "HEAD")
+    }
+    exec.result.get() // throws on a non-zero exit, caught below
+    exec.standardOutput.asText.get().trim()
+}.getOrNull()?.takeIf { it.isNotBlank() } ?: "unknown"
 val uniffiOut = layout.buildDirectory.dir("generated/uniffi/kotlin")
 val psArgs = listOf("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File")
 
@@ -44,6 +54,7 @@ android {
         versionCode = 1
         versionName = "0.1.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        buildConfigField("String", "GIT_SHA", "\"$gitSha\"")
         ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
     }
 
@@ -63,7 +74,11 @@ android {
         }
     }
 
-    buildFeatures { compose = true }
+    buildFeatures {
+        compose = true
+        // For BuildConfig (GIT_SHA), consumed by the benchmark report (Task 10).
+        buildConfig = true
+    }
 
     sourceSets.getByName("main") {
         kotlin.directories.add(uniffiOut.get().asFile.absolutePath)
@@ -110,4 +125,7 @@ dependencies {
     // test artifact is added here.
     testImplementation(libs.junit)
     testImplementation(libs.kotlinx.coroutines.test)
+    // Real org.json for the JVM: BenchmarkJson's report is round-tripped through JSONObject in
+    // unit tests, and android.jar's stub copy throws "not mocked" outside an Android runtime.
+    testImplementation(libs.org.json)
 }
