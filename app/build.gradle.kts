@@ -100,4 +100,10 @@ dependencies {
     // Espresso < 3.7 crashes on Android 16 / API 37 (InputManager.getInstance removed).
     androidTestImplementation(libs.androidx.test.espresso.core)
     debugImplementation(libs.androidx.compose.ui.test.manifest)
+
+    // JVM unit tests: ReaderLogic and PageWindow (fakes + kotlinx-coroutines-test). Coroutines
+    // core is already on the classpath transitively (Compose runtime / activity), so only the
+    // test artifact is added here.
+    testImplementation(libs.junit)
+    testImplementation(libs.kotlinx.coroutines.test)
 }
