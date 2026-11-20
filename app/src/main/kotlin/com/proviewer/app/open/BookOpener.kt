@@ -3,9 +3,11 @@ package com.proviewer.app.open
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.os.ParcelFileDescriptor
 import android.os.StatFs
 import android.provider.OpenableColumns
 import com.proviewer.app.engine.NativeBook
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
@@ -25,6 +27,9 @@ sealed interface OpenResult {
  * Opens a CBZ/ZIP through the engine. A seekable file descriptor is opened directly (`openFd`);
  * a non-seekable descriptor, a provider that cannot offer a whole-file fd, or a plain `file://`
  * URI falls back to copying the stream into `cacheDir/opened/<uuid>.cbz` and opening it by path.
+ *
+ * Every failure path returns [OpenResult.Failed] rather than throwing; only coroutine cancellation
+ * propagates.
  */
 class BookOpener(private val context: Context, private val engine: Engine) {
 
@@ -39,7 +44,7 @@ class BookOpener(private val context: Context, private val engine: Engine) {
         val opened = tryOpenFd(uri, meta.title)
         if (opened != null) return opened
 
-        return withContext(Dispatchers.IO) { copyToCacheAndOpen(uri, meta, onCopyProgress) }
+        return copyToCacheAndOpen(uri, meta, onCopyProgress)
     }
 
     /**
@@ -54,14 +59,31 @@ class BookOpener(private val context: Context, private val engine: Engine) {
         } ?: return null
         val fd = pfd.detachFd()
         return withContext(Dispatchers.IO) {
+            val book = try {
+                engine.openFd(fd) // takes ownership of the fd
+            } catch (e: EngineException.NotSeekable) {
+                return@withContext null // the engine closed the fd; fall back to the copy path
+            } catch (e: EngineException) {
+                // Rust dropped the fd on every EngineException return path.
+                return@withContext OpenResult.Failed(reasonOf(e))
+            } catch (e: CancellationException) {
+                closeFd(fd) // openFd never took ownership; the fd is still ours
+                throw e
+            } catch (e: Throwable) {
+                // Anything but EngineException (e.g. an uniffi InternalException from a Rust panic)
+                // leaves the fd in Kotlin's hands; close it so it is never orphaned.
+                closeFd(fd)
+                return@withContext OpenResult.Failed(reasonOfUnexpected(e))
+            }
+
             try {
-                val book = engine.openFd(fd) // takes ownership of the fd
                 takePersistablePermission(uri)
                 OpenResult.Opened(NativeBook(book, copiedFile = null), title)
-            } catch (e: EngineException.NotSeekable) {
-                null // the engine closed the fd; fall back to the copy path
-            } catch (e: EngineException) {
-                OpenResult.Failed(reasonOf(e))
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                // NativeBook's constructor already released the book (and its fd) if it threw.
+                OpenResult.Failed(reasonOfFailure(e))
             }
         }
     }
@@ -74,6 +96,10 @@ class BookOpener(private val context: Context, private val engine: Engine) {
             OpenResult.Opened(NativeBook(book, copiedFile = null), title)
         } catch (e: EngineException) {
             OpenResult.Failed(reasonOf(e))
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Throwable) {
+            OpenResult.Failed(reasonOfUnexpected(e))
         }
     }
 
@@ -89,46 +115,59 @@ class BookOpener(private val context: Context, private val engine: Engine) {
         var output: FileOutputStream? = null
         var succeeded = false
         try {
-            input = context.contentResolver.openInputStream(uri)
-                ?: return@withContext OpenResult.Failed("no readable stream for $uri")
-            output = FileOutputStream(dest)
+            try {
+                input = context.contentResolver.openInputStream(uri)
+                    ?: return@withContext OpenResult.Failed("no readable stream for $uri")
 
-            if (meta.size != null) {
-                val free = StatFs(dir.absolutePath).availableBytes
-                if (free < meta.size + FREE_SPACE_MARGIN) {
-                    return@withContext OpenResult.Failed("not enough free space to copy $uri")
+                // Check free space before creating the output file, so a refusal never leaves
+                // an empty destination behind.
+                if (meta.size != null) {
+                    val free = StatFs(dir.absolutePath).availableBytes
+                    if (free < meta.size + FREE_SPACE_MARGIN) {
+                        return@withContext OpenResult.Failed("not enough free space to copy $uri")
+                    }
                 }
-            }
 
-            val buffer = ByteArray(COPY_BUFFER_BYTES)
-            var copied = 0L
-            while (true) {
-                ensureActive()
-                val n = input.read(buffer)
-                if (n < 0) break
-                output.write(buffer, 0, n)
-                copied += n
-                onCopyProgress(copied, meta.size)
-            }
-            output.flush()
-            output.close()
-            output = null
-            input.close()
-            input = null
+                output = FileOutputStream(dest)
 
-            val book = try {
-                engine.openPath(dest.absolutePath)
-            } catch (e: EngineException) {
-                return@withContext OpenResult.Failed(reasonOf(e))
+                val buffer = ByteArray(COPY_BUFFER_BYTES)
+                var copied = 0L
+                while (true) {
+                    ensureActive()
+                    val n = input.read(buffer)
+                    if (n < 0) break
+                    output.write(buffer, 0, n)
+                    copied += n
+                    onCopyProgress(copied, meta.size)
+                }
+                output.flush()
+                output.close()
+                output = null
+                input.close()
+                input = null
+
+                val book = engine.openPath(dest.absolutePath)
+                takePersistablePermission(uri)
+                succeeded = true
+                OpenResult.Opened(NativeBook(book, dest), meta.title)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                OpenResult.Failed(reasonOfFailure(e))
             }
-            takePersistablePermission(uri)
-            succeeded = true
-            OpenResult.Opened(NativeBook(book, dest), meta.title)
         } finally {
-            input?.close()
-            output?.close()
+            runCatching { input?.close() }
+            runCatching { output?.close() }
             // A partial copy is deleted on cancellation and on any failure before a successful open.
-            if (!succeeded) dest.delete()
+            if (!succeeded) runCatching { dest.delete() }
+        }
+    }
+
+    private fun closeFd(fd: Int) {
+        try {
+            ParcelFileDescriptor.adoptFd(fd).close()
+        } catch (e: Exception) {
+            // Best effort: nothing else can be done with a raw fd that will not close.
         }
     }
 
@@ -176,6 +215,18 @@ class BookOpener(private val context: Context, private val engine: Engine) {
         }
         return if (detail.isBlank()) kind else "$kind: $detail"
     }
+
+    /** Reason for a copy-path failure: the [EngineException] detail, else the exception type name. */
+    private fun reasonOfFailure(e: Exception): String = when (e) {
+        is EngineException -> reasonOf(e)
+        else -> reasonOfUnexpected(e)
+    }
+
+    /**
+     * Reason for a non-[EngineException] failure (e.g. an uniffi `InternalException`). These carry
+     * no `detail` field; use the type name, never `message`.
+     */
+    private fun reasonOfUnexpected(e: Throwable): String = e::class.simpleName ?: "OpenError"
 
     private companion object {
         const val COPY_BUFFER_BYTES = 64 * 1024

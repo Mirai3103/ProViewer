@@ -76,7 +76,7 @@ class MainActivity : ComponentActivity() {
         openedBook = null
         if (book != null) {
             // Close off the main thread on a throwaway scope so it survives this scope's cancel.
-            CoroutineScope(Dispatchers.IO).launch { book.close() }
+            CoroutineScope(Dispatchers.IO).launch { book.closeAsync() }
         }
         scope.cancel()
         super.onDestroy()
@@ -92,12 +92,14 @@ class MainActivity : ComponentActivity() {
                 }
             } catch (e: CancellationException) {
                 throw e
+            } catch (e: Exception) {
+                OpenResult.Failed(e::class.simpleName ?: "open failed")
             } finally {
                 copyProgress = null
             }
             when (result) {
                 is OpenResult.Opened -> {
-                    openedBook?.close()
+                    openedBook?.closeAsync()
                     openedBook = result.book
                     screen = Screen.Reader
                 }

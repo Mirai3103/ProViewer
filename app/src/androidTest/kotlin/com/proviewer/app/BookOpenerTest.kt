@@ -68,8 +68,31 @@ class BookOpenerTest {
         val copied = opened.book.copiedFile
         assertNotNull("a non-seekable pipe must be copied", copied)
         assertTrue("copied file must exist", copied!!.exists())
-        opened.book.close()
+        opened.book.closeAsync()
+        assertTrue("closeAsync must destroy the Book", opened.book.book.uniffiIsDestroyed)
         assertFalse("copied file must be deleted after close", copied.exists())
+    }
+
+    @Test
+    fun close_is_idempotent() = runBlocking {
+        val result = opener.open(uri("pipe", "mixed-small.cbz")) { _, _ -> }
+        val opened = result as OpenResult.Opened
+        val copied = opened.book.copiedFile
+        assertNotNull(copied)
+        opened.book.closeAsync()
+        assertTrue("first closeAsync must destroy the Book", opened.book.book.uniffiIsDestroyed)
+        assertFalse("copied file must be deleted after first close", copied!!.exists())
+        opened.book.closeAsync() // idempotent: no throw, still destroyed
+        opened.book.close()      // AutoCloseable close is idempotent too
+        assertFalse("copied file stays deleted after repeated close", copied.exists())
+    }
+
+    @Test
+    fun broken_stream_returns_failed() = runBlocking {
+        val result = opener.open(uri("broken", "mixed-small.cbz")) { _, _ -> }
+        assertTrue("a throwing stream must map to Failed, got: $result", result is OpenResult.Failed)
+        val failed = result as OpenResult.Failed
+        assertTrue("reason must name the failure, was: ${failed.reason}", failed.reason.contains("FileNotFound"))
     }
 
     @Test

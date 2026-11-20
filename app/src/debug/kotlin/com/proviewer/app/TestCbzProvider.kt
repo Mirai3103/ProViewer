@@ -24,6 +24,8 @@ import kotlin.concurrent.thread
  *  - `partial/<name>`: an [AssetFileDescriptor] with an explicit declared length, so
  *    `openFileDescriptor` throws ("Not a whole file") while `openInputStream` still returns the
  *    full stream — the same shape as asset-backed and some cloud providers.
+ *  - `broken/<name>`: [openAssetFile] throws [FileNotFoundException], so both `openFileDescriptor`
+ *    and `openInputStream` fail; the copy fallback must surface a `Failed` result rather than throw.
  *
  * The corpus is generated lazily into the provider's cache directory (the app cache) with
  * [CorpusGenerator.ensure] and read back from there.
@@ -70,6 +72,7 @@ class TestCbzProvider : ContentProvider() {
 
     override fun openAssetFile(uri: Uri, mode: String): AssetFileDescriptor {
         val parsed = parse(uri) ?: throw FileNotFoundException("bad uri $uri")
+        if (parsed.form == "broken") throw FileNotFoundException("simulated unreadable stream for $uri")
         if (parsed.form != "partial") return super.openAssetFile(uri, mode)!!
         val file = corpusFile(parsed.name)
         if (!file.isFile) throw FileNotFoundException("no such file ${parsed.name}")

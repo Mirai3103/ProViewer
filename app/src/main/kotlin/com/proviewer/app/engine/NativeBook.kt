@@ -1,5 +1,7 @@
 package com.proviewer.app.engine
 
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import uniffi.proviewer_core.Book
 import uniffi.proviewer_core.PageInfo
 import uniffi.proviewer_core.releaseBookHandle
@@ -12,8 +14,12 @@ import java.util.concurrent.atomic.AtomicBoolean
  * called a second time).
  *
  * [close] is idempotent and releases the handle, destroys the uniffi [Book] and deletes
- * [copiedFile]. It must be called from a background thread — the reader dispatches it on
- * `Dispatchers.IO`; none of it is a decode or render.
+ * [copiedFile]. [closeAsync] runs [close] on `Dispatchers.IO` (the brief requires `close()` to run
+ * off the main thread); production callers go through [closeAsync].
+ *
+ * If the constructor fails after the [Book] has been created (i.e. `nativeHandle()` or `pageCount()`
+ * throws), the already-acquired [Book] (and any derived handle) is released before rethrowing so it
+ * is never orphaned.
  */
 class NativeBook(
     val book: Book,
@@ -21,9 +27,20 @@ class NativeBook(
 ) : AutoCloseable {
 
     /** The single handle returned by [Book.nativeHandle]. Never re-derived. */
-    val handle: Long = book.nativeHandle().toLong()
+    val handle: Long = try {
+        book.nativeHandle().toLong()
+    } catch (t: Throwable) {
+        runCatching { book.destroy() }
+        throw t
+    }
 
-    val pageCount: Int = book.pageCount().toInt()
+    val pageCount: Int = try {
+        book.pageCount().toInt()
+    } catch (t: Throwable) {
+        runCatching { releaseBookHandle(handle.toULong()) }
+        runCatching { book.destroy() }
+        throw t
+    }
 
     private val infoCache = HashMap<Int, PageInfo>()
     private val closed = AtomicBoolean(false)
@@ -44,4 +61,7 @@ class NativeBook(
             }
         }
     }
+
+    /** Runs [close] on [Dispatchers.IO]; the brief requires close to run off the main thread. */
+    suspend fun closeAsync() = withContext(Dispatchers.IO) { close() }
 }
