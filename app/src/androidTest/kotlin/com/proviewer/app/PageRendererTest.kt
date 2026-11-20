@@ -4,18 +4,20 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.proviewer.app.bench.CorpusGenerator
 import com.proviewer.app.engine.NativeBook
+import com.proviewer.app.engine.PageImage
 import com.proviewer.app.engine.PageRenderer
 import com.proviewer.app.engine.UploadStrategy
 import com.proviewer.app.reader.FitMode
 import com.proviewer.app.reader.PageRegion
 import com.proviewer.app.reader.baseSize
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
-import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import uniffi.proviewer_core.Engine
@@ -98,16 +100,23 @@ class PageRendererTest {
             val outW = min(w, 3200)
             val outH = (h.toLong() * outW / w).toInt()
 
-            // Launch on Default so the render is not starved by the poll loop below (which blocks
-            // the runBlocking event-loop thread).
-            val job = launch(Dispatchers.Default) { renderer.render(0, PageRegion(0, 0, w, h, outW, outH)) }
-            val deadline = System.currentTimeMillis() + 20_000
-            while (renderer.openHardwareBuffers == 0 && System.currentTimeMillis() < deadline) {
-                Thread.sleep(1)
-            }
-            assertTrue("render never allocated a hardware buffer", renderer.openHardwareBuffers > 0)
+            // Deterministic: wait on the allocation hook (fired right after the hardware target is
+            // allocated, before the JNI render) instead of polling the counter.
+            val allocated = CompletableDeferred<Unit>()
+            renderer.onTargetAllocated = { allocated.complete(Unit) }
 
-            job.cancelAndJoin()
+            var image: PageImage? = null
+            val deferred = async(Dispatchers.Default) {
+                renderer.render(0, PageRegion(0, 0, w, h, outW, outH)).also { image = it }
+            }
+            try {
+                withTimeout(20_000) { allocated.await() }
+                deferred.cancelAndJoin()
+            } finally {
+                // Defensive: if the render somehow completed before cancellation, release its image
+                // so the buffer counter can never leak (the normal path cancels during the decode).
+                image?.release()
+            }
             assertEquals(0, renderer.openHardwareBuffers)
         }
     }

@@ -149,4 +149,45 @@ class PageWindowTest {
         assertTrue((slot as PageSlot.Failed).reason.contains("IllegalStateException"))
         assertTrue("page 5 should still render", window.pages[5] is PageSlot.Ready)
     }
+
+    @Test
+    fun close_releases_ready_images_and_blocks_update() = runTest {
+        val renderer = FakeRenderer(pageCount = 20)
+        val window = PageWindow(this, renderer, ahead = 3, behind = 1)
+
+        window.update(5, forward = true, viewW = 1080, viewH = 2378, mode = FitMode.Screen)
+        advanceUntilIdle()
+        assertEquals(5, window.pages.size)
+        assertTrue(renderer.released.isEmpty())
+
+        // close() releases every Ready image and clears the slots.
+        window.close()
+        assertEquals(setOf(4, 5, 6, 7, 8), renderer.released.toSet())
+        assertTrue(window.pages.isEmpty())
+
+        // update() after close() must not start new renders.
+        window.update(9, forward = true, viewW = 1080, viewH = 2378, mode = FitMode.Screen)
+        advanceUntilIdle()
+        assertEquals("no new render may start after close", 5, renderer.started.size)
+        assertTrue(window.pages.isEmpty())
+    }
+
+    @Test
+    fun close_during_inflight_render_publishes_nothing() = runTest {
+        val renderer = FakeRenderer(pageCount = 20).apply { hold = CompletableDeferred() }
+        val window = PageWindow(this, renderer, ahead = 3, behind = 1)
+
+        window.update(5, forward = true, viewW = 1080, viewH = 2378, mode = FitMode.Screen)
+        runCurrent() // all five renders are now in-flight (suspended on the gate)
+        assertEquals(listOf(5, 6, 7, 8, 4), renderer.started.map { it.first })
+
+        // Close while the renders are completing, then let them finish: the cancelled jobs must
+        // not publish a Ready slot.
+        window.close()
+        renderer.hold!!.complete(Unit)
+        advanceUntilIdle()
+
+        assertTrue("no slot may be published after close", window.pages.isEmpty())
+        assertEquals(setOf(4, 5, 6, 7, 8), renderer.cancelled.toSet())
+    }
 }

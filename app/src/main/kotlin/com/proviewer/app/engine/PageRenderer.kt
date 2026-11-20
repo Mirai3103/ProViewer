@@ -74,15 +74,22 @@ interface PageSourceRenderer {
  */
 class PageRenderer(
     private val book: NativeBook,
-    var strategy: UploadStrategy,
+    @Volatile var strategy: UploadStrategy,
 ) : PageSourceRenderer {
 
     /** True once a hardware render has fallen back to software (alloc/wrap failure). */
-    var fellBack: Boolean = false
+    @Volatile var fellBack: Boolean = false
         private set
 
     /** Debug counter of currently open hardware buffers (incremented on allocation, decremented on release). */
     val openHardwareBuffers: Int get() = openBuffers.get()
+
+    /**
+     * Test-only hook invoked once, right after a hardware target is allocated and before the JNI
+     * render call. Lets the instrumented cancel test wait deterministically for allocation instead
+     * of polling [openHardwareBuffers].
+     */
+    internal var onTargetAllocated: (() -> Unit)? = null
 
     private val dispatcher = Dispatchers.Default.limitedParallelism(2)
     private val openBuffers = AtomicInteger(0)
@@ -170,6 +177,7 @@ class PageRenderer(
                 null
             } ?: return null // wrap failed; finally closes the buffer
             bitmap = wrapped
+            onTargetAllocated?.invoke()
             cancellableRender(token) {
                 NativePixels.renderToHardwareBuffer(
                     book.handle, page, region.x, region.y, region.w, region.h, buffer, token,

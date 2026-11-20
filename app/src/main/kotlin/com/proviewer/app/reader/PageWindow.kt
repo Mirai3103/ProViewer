@@ -36,6 +36,7 @@ class PageWindow(
 
     private val running = ConcurrentHashMap<Int, Running>()
     @Volatile private var currentPage = -1
+    @Volatile private var closed = false
 
     /**
      * Reconciles the window to the given view. Evicts pages outside the window (releasing their
@@ -43,8 +44,11 @@ class PageWindow(
      * `windowPages` priority order, and calls `prefetchHint` once.
      */
     fun update(current: Int, forward: Boolean, viewW: Int, viewH: Int, mode: FitMode) {
+        if (closed) return
         currentPage = current
-        val target = windowOrder(current, forward)
+        // The window is bounded by pageSize(page) == null (out of range), not by a total page
+        // count, so Int.MAX_VALUE just disables windowPages' count-based range check.
+        val target = windowPages(current, Int.MAX_VALUE, ahead, behind, forward)
         val targetSet = target.toHashSet()
 
         // Evict pages that left the window.
@@ -94,6 +98,7 @@ class PageWindow(
 
     /** Cancels all work and releases every held image. */
     fun close() {
+        closed = true
         for (r in running.values) r.job.cancel()
         running.clear()
         pages.values.filterIsInstance<PageSlot.Ready>().forEach { it.image.release() }
@@ -105,12 +110,16 @@ class PageWindow(
         val job = scope.launch {
             try {
                 val image = renderer.renderBase(page, size)
+                if (closed) {
+                    image.release()
+                    return@launch
+                }
                 if (page != currentPage) image.prepareToDraw()
                 pages[page] = PageSlot.Ready(image, size)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Throwable) {
-                pages[page] = PageSlot.Failed(reasonOf(e))
+                if (!closed) pages[page] = PageSlot.Failed(reasonOf(e))
             }
         }
         running[page] = Running(job, size)
@@ -118,18 +127,12 @@ class PageWindow(
         job.invokeOnCompletion { running.remove(page, Running(job, size)) }
     }
 
-    /** Priority order: current, then ahead nearest-first, then behind nearest-first. */
-    private fun windowOrder(current: Int, forward: Boolean): List<Int> {
-        val out = ArrayList<Int>(1 + ahead + behind)
-        out.add(current)
-        val step = if (forward) 1 else -1
-        for (i in 1..ahead) out.add(current + step * i)
-        for (i in 1..behind) out.add(current - step * i)
-        return out
-    }
-
     private fun reasonOf(e: Throwable): String = when (e) {
         is NativeRenderException -> e.detail
-        else -> e::class.simpleName ?: "RenderError"
+        else -> {
+            val name = e::class.simpleName ?: "RenderError"
+            val message = e.message?.takeIf { it.isNotBlank() }
+            if (message != null) "$name: $message" else name
+        }
     }
 }
