@@ -6,7 +6,6 @@ import android.content.ContextWrapper
 import android.view.Window
 import android.view.WindowManager
 import androidx.activity.compose.BackHandler
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Box
@@ -16,7 +15,6 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.material3.MaterialTheme
@@ -28,29 +26,26 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableStateMapOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
-import com.proviewer.app.engine.PageImage
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlin.math.roundToInt
-import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * The single-page reader: an LTR/RTL [HorizontalPager], full-screen tap zones, an overlay with the
@@ -102,6 +97,8 @@ fun ReaderScreen(
             }
     }
 
+    // Each rendered page publishes its ZoomablePage automation; the current page's is exposed.
+    val pageZooms = remember { mutableStateMapOf<Int, ZoomAutomation>() }
     val automation = remember(vm, pagerState) {
         object : ReaderAutomation {
             override suspend fun turnTo(page: Int, animate: Boolean) {
@@ -113,7 +110,7 @@ fun ReaderScreen(
                 vm.window?.awaitIdle()
             }
 
-            override val zoom: ZoomAutomation? get() = null
+            override val zoom: ZoomAutomation? get() = pageZooms[vm.state?.page]
         }
     }
     LaunchedEffect(automation) { onAutomation(automation) }
@@ -133,7 +130,15 @@ fun ReaderScreen(
             beyondViewportPageCount = 1,
             modifier = Modifier.fillMaxSize(),
         ) { page ->
-            PageSlotView(page, vm, state.direction, probe)
+            PageSlotView(
+                page = page,
+                vm = vm,
+                direction = state.direction,
+                probe = probe,
+                onZoom = { zoomAutomation ->
+                    if (zoomAutomation == null) pageZooms.remove(page) else pageZooms[page] = zoomAutomation
+                },
+            )
         }
 
         if (state.overlayVisible) {
@@ -143,66 +148,62 @@ fun ReaderScreen(
 }
 
 @Composable
-private fun PageSlotView(page: Int, vm: ReaderViewModel, direction: Direction, probe: ReaderProbe) {
+private fun PageSlotView(
+    page: Int,
+    vm: ReaderViewModel,
+    direction: Direction,
+    probe: ReaderProbe,
+    onZoom: (ZoomAutomation?) -> Unit,
+) {
     val slot = vm.window?.pages?.get(page)
+    val slotSize = remember { mutableStateOf(IntSize.Zero) }
+    // Telephoto 0.19.0 captures zoomable's onClick once (its tap node only swaps the handler when
+    // the parameter's nullability flips), so the handler must resolve the live values itself
+    // instead of capturing this recomposition's direction and size.
+    val onSlotTap: (Offset) -> Unit = remember(vm) {
+        { offset: Offset ->
+            when (tapAction(offset.x, slotSize.value.width.toFloat(), vm.state?.direction ?: Direction.Ltr)) {
+                TapAction.Previous -> vm.previous()
+                TapAction.Next -> vm.next()
+                TapAction.ToggleOverlay -> vm.toggleOverlay()
+            }
+        }
+    }
     Box(
         Modifier
             .fillMaxSize()
             .testTag("reader-page-$page")
-            .pointerInput(direction) {
-                detectTapGestures { offset ->
-                    when (tapAction(offset.x, size.width.toFloat(), direction)) {
-                        TapAction.Previous -> vm.previous()
-                        TapAction.Next -> vm.next()
-                        TapAction.ToggleOverlay -> vm.toggleOverlay()
-                    }
-                }
-            },
+            .onSizeChanged { slotSize.value = it }
+            .then(
+                if (slot is PageSlot.Ready) {
+                    // The rendered page handles taps through its zoomable gestures.
+                    Modifier
+                } else {
+                    Modifier.pointerInput(direction) { detectTapGestures(onTap = onSlotTap) }
+                },
+            ),
     ) {
         when (slot) {
             is PageSlot.Ready -> {
-                val bitmap = slot.image.bitmap
-                if (bitmap != null) {
-                    SharpPage(page, slot.image, slot.size, vm.state?.fitMode ?: FitMode.Screen, probe)
+                val renderer = vm.renderer
+                val state = vm.state
+                val naturalSize = renderer?.pageSize(page)
+                if (renderer != null && state != null && naturalSize != null) {
+                    ZoomablePage(
+                        page = page,
+                        slot = slot,
+                        pageSize = naturalSize,
+                        renderer = renderer,
+                        probe = probe,
+                        mode = state.fitMode,
+                        onTap = onSlotTap,
+                        onZoom = onZoom,
+                    )
                 }
             }
             is PageSlot.Failed -> ErrorSlot(page, slot.reason)
             else -> Box(Modifier.fillMaxSize().background(Color(0xFF111111)))
         }
-    }
-}
-
-@Composable
-private fun SharpPage(
-    page: Int,
-    image: PageImage,
-    size: IntSize,
-    mode: FitMode,
-    probe: ReaderProbe,
-) {
-    val bitmap = image.bitmap ?: return
-    val density = LocalDensity.current
-    // Fire the sharp-draw probe exactly once per (page, bitmap) — not per frame while static.
-    val fired = remember(page, bitmap) { AtomicBoolean(false) }
-    val alignment = when (mode) {
-        FitMode.Screen -> Alignment.Center
-        FitMode.Width -> Alignment.TopStart
-        FitMode.Height -> Alignment.TopStart
-    }
-    Box(Modifier.fillMaxSize(), contentAlignment = alignment) {
-        Image(
-            bitmap = bitmap.asImageBitmap(),
-            contentDescription = null,
-            contentScale = ContentScale.Fit,
-            modifier = Modifier
-                .size(with(density) { size.width.toDp() }, with(density) { size.height.toDp() })
-                .drawWithContent {
-                    drawContent()
-                    if (fired.compareAndSet(false, true)) {
-                        probe.onSharpPageDrawn(page, System.nanoTime())
-                    }
-                },
-        )
     }
 }
 

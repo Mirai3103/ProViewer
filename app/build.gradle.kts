@@ -91,6 +91,8 @@ dependencies {
     implementation(libs.androidx.compose.foundation)
     implementation(libs.androidx.activity.compose)
     implementation(libs.androidx.lifecycle.viewmodel.compose)
+    // Zoom gestures for the reader pages (draw-phase transforms + pan-to-edge pager hand-off).
+    implementation(libs.telephoto.zoomable)
     // uniffi's Kotlin runtime. @aar so the Android-specific libjnidispatch.so is packaged.
     implementation("${libs.jna.get()}@aar")
 

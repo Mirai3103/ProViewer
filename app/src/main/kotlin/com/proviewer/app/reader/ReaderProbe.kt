@@ -6,11 +6,20 @@ import androidx.compose.ui.geometry.Offset
 /**
  * Test/benchmark observability seam for the reader. [onSharpPageDrawn] fires once when a page's
  * `Ready` base bitmap is actually drawn (never for a placeholder, never per frame while the image
- * is static); [onDetailRender] is unused until Task 8 wires the detail re-render.
+ * is static); [onDetailRender] fires on the detail re-render lifecycle; [onDetailImage] reports
+ * the detail region currently drawn over the base.
  */
 interface ReaderProbe {
     fun onSharpPageDrawn(page: Int, drawNanos: Long) {}
     fun onDetailRender(page: Int, event: String) {}
+
+    /**
+     * The detail [PageRegion] now drawn over a page's base bitmap, or null when a previously
+     * shown detail has been cleared. The rendered bitmap's size is `region.outW x region.outH`
+     * (Task 6's `PageRenderer.render` produces exactly that target), so this pins what the
+     * reader displays while zoomed.
+     */
+    fun onDetailImage(page: Int, region: PageRegion?) {}
 }
 
 /** Composition-local probe; a no-op by default so production code never has to null-check. */
