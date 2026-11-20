@@ -356,4 +356,34 @@ class ZoomTest {
         val achieved = sx * region.outW / region.w
         assertEquals("achieved zoom must equal the spec maximum", maxZoom, achieved, 0.15f)
     }
+
+    @Test
+    fun failed_detail_render_degrades_instead_of_crashing() {
+        val probe = RecordingProbe()
+        val readerVm = launchReader(corpusFile("screentone.cbz"), probe)
+        awaitReadyAndSettled(readerVm)
+        val zoom = zoomAutomation()
+
+        // Fail a zoomed detail render deterministically: close the book underneath the reader as
+        // soon as the detail render has allocated its hardware target, so the in-flight render
+        // fails with InvalidHandle - the same non-cancellation failure the base pipeline degrades
+        // to PageSlot.Failed for. The reader must degrade instead of crashing.
+        val allocated = CompletableDeferred<Unit>()
+        val bookClosed = CompletableDeferred<Unit>()
+        readerVm.renderer!!.onTargetAllocated = {
+            allocated.complete(Unit)
+            runBlocking { bookClosed.await() }
+        }
+        mainScope.launch { zoom.zoomTo(2f, viewportCentre(readerVm), animate = false) }
+        composeRule.waitUntil(20_000) { allocated.isCompleted }
+        readerVm.book!!.close()
+        bookClosed.complete(Unit) // let the render proceed against the closed book
+        composeRule.waitUntil(20_000) { probe.eventCount("cancelled") >= 1 }
+
+        assertNoScopeErrors()
+        // The failed render was surfaced through the pinned probe vocabulary...
+        assertEquals(1, probe.eventCount("start"))
+        // ...and the process survived: the reader is still composed and interactive.
+        composeRule.onNodeWithTag("reader-root").assertExists()
+    }
 }

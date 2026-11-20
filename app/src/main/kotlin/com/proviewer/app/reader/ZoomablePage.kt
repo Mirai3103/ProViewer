@@ -68,9 +68,15 @@ private class DetailHost {
     var job: Job? = null
     var shown by mutableStateOf<ShownDetail?>(null)
 
+    /** Cancels any pending or running render and drops the shown detail, reporting it cleared. */
     fun clear(probe: ReaderProbe, page: Int) {
         job?.cancel()
         job = null
+        hide(probe, page)
+    }
+
+    /** Drops the shown detail (if any) and reports it cleared, without touching the job. */
+    fun hide(probe: ReaderProbe, page: Int) {
         shown?.let {
             it.image.release()
             probe.onDetailImage(page, null)
@@ -228,32 +234,41 @@ fun ZoomablePage(
                 }
                 detail.job?.cancel()
                 detail.job = effectScope.launch {
-                    try {
+                    val image = try {
                         probe.onDetailRender(page, "start")
-                        val image = renderer.render(page, region)
-                        if (!isActive) {
-                            image.release()
-                            probe.onDetailRender(page, "cancelled")
-                            return@launch
-                        }
-                        image.prepareToDraw()
-                        detail.shown?.image?.release()
-                        detail.shown = ShownDetail(
-                            image = image,
-                            // The region's on-screen rect: the intersection of the transformed
-                            // content with the viewport, matching visibleRegion's x0/y0.
-                            rect = Rect(
-                                left = contentLeft.coerceAtLeast(0f),
-                                top = contentTop.coerceAtLeast(0f),
-                                right = contentLeft.coerceAtLeast(0f) + region.outW,
-                                bottom = contentTop.coerceAtLeast(0f) + region.outH,
-                            ),
-                        )
-                        probe.onDetailImage(page, region)
-                        probe.onDetailRender(page, "done")
+                        renderer.render(page, region)
                     } catch (e: CancellationException) {
                         probe.onDetailRender(page, "cancelled")
+                        throw e
+                    } catch (e: Throwable) {
+                        // A failed detail render degrades the way the base pipeline degrades a
+                        // failed render (PageSlot.Failed): drop any stale detail and keep the
+                        // scaled base visible instead of crashing the reader. The next settled
+                        // transformation simply tries again.
+                        detail.hide(probe, page)
+                        probe.onDetailRender(page, "cancelled")
+                        return@launch
                     }
+                    if (!isActive) {
+                        image.release()
+                        probe.onDetailRender(page, "cancelled")
+                        return@launch
+                    }
+                    image.prepareToDraw()
+                    detail.shown?.image?.release()
+                    detail.shown = ShownDetail(
+                        image = image,
+                        // The region's on-screen rect: the intersection of the transformed
+                        // content with the viewport, matching visibleRegion's x0/y0.
+                        rect = Rect(
+                            left = contentLeft.coerceAtLeast(0f),
+                            top = contentTop.coerceAtLeast(0f),
+                            right = contentLeft.coerceAtLeast(0f) + region.outW,
+                            bottom = contentTop.coerceAtLeast(0f) + region.outH,
+                        ),
+                    )
+                    probe.onDetailImage(page, region)
+                    probe.onDetailRender(page, "done")
                 }
             }
     }
