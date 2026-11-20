@@ -2,24 +2,22 @@ package com.proviewer.app
 
 import android.content.Intent
 import android.os.Bundle
+import android.view.KeyEvent
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.fillMaxSize
+import androidx.activity.viewModels
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Text
-import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.testTag
 import com.proviewer.app.bench.VariantFeatures
-import com.proviewer.app.engine.NativeBook
 import com.proviewer.app.home.HomeScreen
 import com.proviewer.app.open.BookOpener
 import com.proviewer.app.open.OpenResult
+import com.proviewer.app.reader.ReaderScreen
+import com.proviewer.app.reader.ReaderViewModel
+import com.proviewer.app.reader.TapAction
+import com.proviewer.app.reader.keyAction
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -30,7 +28,8 @@ import kotlinx.coroutines.launch
 
 /**
  * Hosts the three Phase 2 screens with a plain screen state (no navigation library): [Home],
- * [Reader] (a placeholder until Task 7) and [Benchmark]. `ACTION_VIEW` intents open the reader.
+ * [Reader] and [Benchmark]. `ACTION_VIEW` intents open the reader. The reader's [ReaderViewModel]
+ * survives rotation; only the current screen name is saved so the reader is restored.
  */
 class MainActivity : ComponentActivity() {
     private enum class Screen { Home, Reader, Benchmark }
@@ -39,18 +38,23 @@ class MainActivity : ComponentActivity() {
     private val opener by lazy { BookOpener(applicationContext, app.engine) }
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
+    /** The reader ViewModel, exposed to instrumented tests (same module, `internal`). */
+    internal val readerViewModel: ReaderViewModel by viewModels()
+
     private var screen by mutableStateOf(Screen.Home)
     private var error by mutableStateOf<String?>(null)
     private var copyProgress by mutableStateOf<Float?>(null)
     private var copyJob: Job? = null
-    private var openedBook: NativeBook? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val viewUri = intent?.takeIf { it.action == Intent.ACTION_VIEW }?.data
-        if (viewUri != null) {
-            screen = Screen.Reader
-            openBook(viewUri)
+        if (savedInstanceState == null) {
+            if (viewUri != null) {
+                openBook(viewUri)
+            }
+        } else {
+            screen = Screen.valueOf(savedInstanceState.getString(KEY_SCREEN) ?: Screen.Home.name)
         }
         setContent {
             MaterialTheme {
@@ -63,23 +67,52 @@ class MainActivity : ComponentActivity() {
                         benchmarkAvailable = VariantFeatures.benchmarkAvailable,
                         onBenchmark = { screen = Screen.Benchmark },
                     )
-                    Screen.Reader -> ReaderPlaceholder()
+                    Screen.Reader -> ReaderScreen(
+                        vm = readerViewModel,
+                        onBack = { exitReader() },
+                    )
                     Screen.Benchmark -> VariantFeatures.BenchmarkScreen(onBack = { screen = Screen.Home })
                 }
             }
         }
     }
 
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putString(KEY_SCREEN, screen.name)
+    }
+
+    /** Volume keys turn pages only while the reader is shown, and are consumed there. */
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        if (screen == Screen.Reader) {
+            when (keyAction(keyCode)) {
+                TapAction.Next -> {
+                    readerViewModel.next()
+                    return true
+                }
+                TapAction.Previous -> {
+                    readerViewModel.previous()
+                    return true
+                }
+                TapAction.ToggleOverlay -> {
+                    readerViewModel.toggleOverlay()
+                    return true
+                }
+                null -> Unit
+            }
+        }
+        return super.onKeyDown(keyCode, event)
+    }
+
     override fun onDestroy() {
         copyJob?.cancel()
-        val book = openedBook
-        openedBook = null
-        if (book != null) {
-            // Close off the main thread on a throwaway scope so it survives this scope's cancel.
-            CoroutineScope(Dispatchers.IO).launch { book.closeAsync() }
-        }
         scope.cancel()
         super.onDestroy()
+    }
+
+    private fun exitReader() {
+        screen = Screen.Home
+        readerViewModel.release()
     }
 
     private fun openBook(uri: android.net.Uri) {
@@ -99,8 +132,7 @@ class MainActivity : ComponentActivity() {
             }
             when (result) {
                 is OpenResult.Opened -> {
-                    openedBook?.closeAsync()
-                    openedBook = result.book
+                    readerViewModel.attach(result)
                     screen = Screen.Reader
                 }
                 is OpenResult.Failed -> {
@@ -110,12 +142,8 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
-}
 
-/** Placeholder reader node until Task 7; it just has to expose the `reader-root` tag. */
-@Composable
-private fun ReaderPlaceholder() {
-    Box(Modifier.fillMaxSize().testTag("reader-root"), contentAlignment = Alignment.Center) {
-        Text("Reader")
+    private companion object {
+        const val KEY_SCREEN = "screen"
     }
 }
