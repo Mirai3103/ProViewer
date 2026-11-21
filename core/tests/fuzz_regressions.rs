@@ -83,7 +83,8 @@ fn harness_runs_on_generated_seeds() {
         harness::run_decode(&std::fs::read(e.unwrap().path()).unwrap());
         images += 1;
     }
-    assert_eq!(images, 35);
+    // 35 extracted image entries plus the two damaged JPEG forms of the first seed.
+    assert_eq!(images, 37);
 }
 
 /// Truncations and bit flips of valid seeds (what libFuzzer does first) must never panic or hang.

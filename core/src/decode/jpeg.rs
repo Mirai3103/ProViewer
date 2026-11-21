@@ -1,11 +1,13 @@
-//! JPEG decoding through libjpeg-turbo (`turbojpeg`), with DCT-scaled decode.
+//! JPEG decoding through libjpeg-turbo's tj3 API (`turbojpeg::raw`), with DCT-scaled decode.
 //!
 //! This module is the only place that knows the backend (the seam for swapping it). The C library is not
 //! memory-safe against hostile input and its aborts cannot be caught, so this module reads the header and checks
 //! every limit before allocating, and hands turbojpeg a buffer we sized with checked arithmetic. turbojpeg never
 //! allocates the output itself.
 
-use turbojpeg::{Colorspace, Decompressor, Image, PixelFormat, ScalingFactor};
+use std::ffi::CStr;
+
+use turbojpeg::raw;
 
 use super::{alloc_zeroed, buffer_len, corrupt, plan, scaled_dim, DecodedImage, PixelLayout};
 use crate::error::{EngineError, Result};
@@ -17,23 +19,57 @@ pub(super) const SUPPORTED_DENOMS: &[u8] = &[1, 2, 4, 8];
 /// Progressive JPEGs can declare huge numbers of scans to burn CPU. Real files use around ten.
 const MAX_SCANS: u32 = 256;
 
+/// Owns a `tjhandle` and destroys it on drop, so every error path stays leak-free.
+struct Decompressor {
+    handle: raw::tjhandle,
+}
+
+impl Decompressor {
+    fn new() -> Result<Self> {
+        let handle = unsafe { raw::tj3Init(raw::TJINIT_TJINIT_DECOMPRESS as i32) };
+        if handle.is_null() {
+            return Err(EngineError::Io {
+                message: format!("jpeg decoder init failed: {}", error_str(std::ptr::null_mut())),
+            });
+        }
+        Ok(Self { handle })
+    }
+}
+
+impl Drop for Decompressor {
+    fn drop(&mut self) {
+        unsafe { raw::tj3Destroy(self.handle) };
+    }
+}
+
 pub(super) fn decode(bytes: &[u8], denom: u8, limits: &Limits) -> Result<DecodedImage> {
-    let mut dec = Decompressor::new().map_err(|e| EngineError::Io {
-        message: format!("jpeg decoder init failed: {e}"),
-    })?;
-    let header = dec.read_header(bytes).map_err(map_err)?;
-    if header.is_lossless {
+    let tj = Decompressor::new()?;
+
+    // Recoverable warnings must not abort the decode (owner decision D3), and progressive scans are capped.
+    set_param(tj.handle, raw::TJPARAM_TJPARAM_STOPONWARNING as i32, 0)?;
+    set_param(tj.handle, raw::TJPARAM_TJPARAM_SCANLIMIT as i32, MAX_SCANS as i32)?;
+
+    let size = raw::size_t::try_from(bytes.len()).map_err(|_| corrupt("jpeg input is too large"))?;
+    // A warning here (e.g. extraneous bytes before the first scan) still leaves the dimensions and
+    // colorspace valid, so it counts as success; only a fatal error is `Corrupt`.
+    if unsafe { raw::tj3DecompressHeader(tj.handle, bytes.as_ptr(), size) } != 0 {
+        check_warning(tj.handle)?;
+    }
+
+    let header_w = get_param(tj.handle, raw::TJPARAM_TJPARAM_JPEGWIDTH as i32)?;
+    let header_h = get_param(tj.handle, raw::TJPARAM_TJPARAM_JPEGHEIGHT as i32)?;
+    if get_param(tj.handle, raw::TJPARAM_TJPARAM_LOSSLESS as i32)? != 0 {
         return Err(EngineError::UnsupportedFormat {
             message: "lossless JPEG is not supported".to_string(),
         });
     }
-    let width =
-        u32::try_from(header.width).map_err(|_| corrupt("jpeg width does not fit in u32"))?;
-    let height =
-        u32::try_from(header.height).map_err(|_| corrupt("jpeg height does not fit in u32"))?;
+    let is_progressive = get_param(tj.handle, raw::TJPARAM_TJPARAM_PROGRESSIVE as i32)? != 0;
+
+    let width = u32::try_from(header_w).map_err(|_| corrupt("jpeg width does not fit in u32"))?;
+    let height = u32::try_from(header_h).map_err(|_| corrupt("jpeg height does not fit in u32"))?;
     // The size turbojpeg reports is the one it will decode, so limits are enforced on it, not on the probe.
     let denom = plan(width, height, denom, SUPPORTED_DENOMS, limits)?;
-    if header.is_progressive || !is_single_interleaved_scan(bytes) {
+    if is_progressive || !is_single_interleaved_scan(bytes) {
         // libjpeg allocates and zeroes a full-size DCT coefficient array (about 2 * w * h * components bytes) for any
         // multi-scan file whatever the denom: progressive (SOF2), and also sequential SOF0/SOF1 files whose first
         // scan does not carry every component (non-interleaved, so several scans). So the SOURCE size must fit the
@@ -48,33 +84,31 @@ pub(super) fn decode(bytes: &[u8], denom: u8, limits: &Limits) -> Result<Decoded
         }
     }
 
-    dec.set_scan_limit(MAX_SCANS).map_err(map_err)?;
-    let factor = ScalingFactor::new(1, usize::from(denom));
-    dec.set_scaling_factor(factor).map_err(map_err)?;
+    set_scaling_factor(tj.handle, denom)?;
     let (out_w, out_h) = (scaled_dim(width, denom), scaled_dim(height, denom));
-    let scaled = header.scaled(factor);
-    if scaled.width != out_w as usize || scaled.height != out_h as usize {
-        return Err(corrupt("jpeg scaled size disagrees with the expected size"));
-    }
 
-    let (format, layout, cmyk) = match header.colorspace {
-        Colorspace::Gray => (PixelFormat::GRAY, PixelLayout::Gray8, false),
+    let colorspace = get_param(tj.handle, raw::TJPARAM_TJPARAM_COLORSPACE as i32)?;
+    let (format, layout, cmyk, channels) = match colorspace as u32 {
+        raw::TJCS_TJCS_GRAY => (raw::TJPF_TJPF_GRAY as i32, PixelLayout::Gray8, false, 1u64),
         // libjpeg cannot convert CMYK/YCCK to RGB itself, so it is decoded as CMYK and converted below.
-        Colorspace::CMYK | Colorspace::YCCK => (PixelFormat::CMYK, PixelLayout::Rgb8, true),
-        _ => (PixelFormat::RGB, PixelLayout::Rgb8, false),
+        raw::TJCS_TJCS_CMYK | raw::TJCS_TJCS_YCCK => {
+            (raw::TJPF_TJPF_CMYK as i32, PixelLayout::Rgb8, true, 4u64)
+        }
+        _ => (raw::TJPF_TJPF_RGB as i32, PixelLayout::Rgb8, false, 3u64),
     };
-    let src_channels = format.size() as u64;
-    let len = buffer_len(out_w, out_h, src_channels)
+    let len = buffer_len(out_w, out_h, channels)
         .ok_or_else(|| corrupt("jpeg output size overflows"))?;
     let mut pixels = alloc_zeroed(len)?;
-    let image = Image {
-        pixels: pixels.as_mut_slice(),
-        width: out_w as usize,
-        pitch: out_w as usize * format.size(),
-        height: out_h as usize,
-        format,
+    let pitch = i32::try_from(u64::from(out_w) * channels)
+        .map_err(|_| corrupt("jpeg output pitch overflows"))?;
+
+    let r = unsafe {
+        raw::tj3Decompress8(tj.handle, bytes.as_ptr(), size, pixels.as_mut_ptr(), pitch, format)
     };
-    dec.decompress(bytes, image).map_err(map_err)?;
+    if r != 0 {
+        // A warning means libjpeg decoded what it could and padded the rest; keep the buffer.
+        check_warning(tj.handle)?;
+    }
 
     if cmyk {
         cmyk_to_rgb_in_place(&mut pixels, has_adobe_marker(bytes));
@@ -88,9 +122,65 @@ pub(super) fn decode(bytes: &[u8], denom: u8, limits: &Limits) -> Result<Decoded
     })
 }
 
-fn map_err(e: turbojpeg::Error) -> EngineError {
-    EngineError::Corrupt {
-        message: format!("jpeg decode failed: {e}"),
+/// The turbojpeg error string for `handle`, or a fallback if none is available.
+fn error_str(handle: raw::tjhandle) -> String {
+    let ptr = unsafe { raw::tj3GetErrorStr(handle) };
+    if ptr.is_null() {
+        "unknown turbojpeg error".to_string()
+    } else {
+        unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned()
+    }
+}
+
+fn set_param(handle: raw::tjhandle, param: i32, value: i32) -> Result<()> {
+    if unsafe { raw::tj3Set(handle, param, value) } != 0 {
+        Err(EngineError::Corrupt {
+            message: format!("jpeg decode failed: {}", error_str(handle)),
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn get_param(handle: raw::tjhandle, param: i32) -> Result<i32> {
+    let v = unsafe { raw::tj3Get(handle, param) };
+    if v < 0 {
+        Err(EngineError::Corrupt {
+            message: format!("jpeg decode failed: {}", error_str(handle)),
+        })
+    } else {
+        Ok(v)
+    }
+}
+
+fn set_scaling_factor(handle: raw::tjhandle, denom: u8) -> Result<()> {
+    let r = unsafe {
+        raw::tj3SetScalingFactor(
+            handle,
+            raw::tjscalingfactor {
+                num: 1,
+                denom: i32::from(denom),
+            },
+        )
+    };
+    if r != 0 {
+        Err(EngineError::Corrupt {
+            message: format!("jpeg decode failed: {}", error_str(handle)),
+        })
+    } else {
+        Ok(())
+    }
+}
+
+/// A `-1` return is tolerable when the last error was a warning (libjpeg already filled what it
+/// could); a fatal error is `Corrupt` with the turbojpeg message.
+fn check_warning(handle: raw::tjhandle) -> Result<()> {
+    if unsafe { raw::tj3GetErrorCode(handle) } == raw::TJERR_TJERR_WARNING as i32 {
+        Ok(())
+    } else {
+        Err(EngineError::Corrupt {
+            message: format!("jpeg decode failed: {}", error_str(handle)),
+        })
     }
 }
 

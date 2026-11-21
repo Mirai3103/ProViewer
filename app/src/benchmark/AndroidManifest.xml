@@ -7,6 +7,18 @@
         <profileable
             android:shell="true"
             tools:targetApi="q" />
+
+        <!-- Shares benchmark result JSONs (Task 10's "Share JSON"): ACTION_SEND of files under
+             filesDir/bench, exported=false so only the app's own grants reach them. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.benchfiles"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/bench_paths" />
+        </provider>
     </application>
 
 </manifest>

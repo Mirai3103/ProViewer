@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Benchmark result JSONs live in filesDir/bench (BenchmarkScreen's "Share JSON"). -->
+<paths>
+    <files-path name="bench" path="bench/" />
+</paths>

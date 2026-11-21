@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Test-only content provider, compiled into the debug variant only. It runs in the app's
+         own process (the instrumentation process), so it shares the app classpath and UID and can
+         serve the corpus generated into the app cache. Declaring it in the androidTest APK instead
+         would start a separate `com.proviewer.app.test` process whose classloader lacks the app's
+         Kotlin stdlib and classes (see task-5 report, "Provider process/classloader finding"). -->
+    <application>
+        <provider
+            android:name="com.proviewer.app.TestCbzProvider"
+            android:authorities="com.proviewer.app.test.cbz"
+            android:exported="true"
+            android:grantUriPermissions="true" />
+
+        <!-- Shares benchmark result JSONs (Task 10's "Share JSON"): ACTION_SEND of files under
+             filesDir/bench, exported=false so only the app's own grants reach them. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.benchfiles"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/bench_paths" />
+        </provider>
+    </application>
+
+</manifest>

@@ -2,26 +2,43 @@
 
 Status: rows a1, a2, a3 and b were **approved by the owner on 2026-11-18** (Phase 0 exit gate). Rows c and d were
 **dropped by the owner on 2026-11-19** (see below). Absolute budgets; there is no competitor baseline
-(spec §1, §7). Measured on the reference device only (OnePlus CPH2767, ~11 GB, Android 16, 120 Hz,
-display locked to max refresh rate); the emulator is never used for performance numbers.
+(spec §1, §7). Measured on a real device by a Benchmark run the owner starts themselves (D1, 2026-11-19: any phone,
+without adb); the reference device is the OnePlus CPH2767 (~11 GB, Android 16, 120 Hz, display locked to max refresh
+rate); the emulator is never used for performance numbers.
 A budget may be tightened with owner approval, never loosened silently.
 
 ## Method
 
-Frame metrics come from **Perfetto FrameTimeline** (`scripts/perf-capture.ps1` → `trace_processor_shell`
-→ `framestat`), not `dumpsys gfxinfo framestats` (120-frame ring buffer, HWUI-only, wrong jank
-definition). A frame is janky when SurfaceFlinger's `jank_type` is anything other than `None` or
-`Buffer Stuffing`. The capture script refuses to record a row if the active refresh rate differs from
-the expected one before or after the run, or if the target package produced zero frames.
+Since 2026-11-19 (owner decision D1), a2, a3 and b are measured by the **in-app Benchmark screen** (`benchmark` build
+type; Phase 2 spec §6.4): the owner starts a run by tapping a button — no adb, no script, on any phone — and the screen
+measures itself while the real reader runs the scenarios. Run conditions (device model, Android version, app version and
+git SHA, refresh rate before and after each scenario, thermal status, battery, emulator flag) are recorded with every
+result, and results are shared as a versioned JSON file.
+
+- **Janky frame (a2, a3):** `Window.OnFrameMetricsAvailableListener` (API 31+); a frame is **janky when
+  `FrameMetrics.TOTAL_DURATION > FrameMetrics.DEADLINE`**. First-draw frames (`FrameMetrics.FIRST_DRAW_FRAME`) are
+  excluded. Frame-duration percentiles are recorded for information only, not budgeted. On API < 31 the screen reports
+  jank as unsupported. Like `gfxinfo`, this sees HWUI frames only — which is everything the Compose reader draws.
+- **a3 is scripted:** animated zoom 1×→3×, pans and zoom-out cycles, including the sharp detail re-render after each
+  settle — no owner gestures.
+- **Page-turn latency (b):** t0 = the moment the page turn is issued (the programmatic equivalent of the finger
+  lifting); t1 = the frame in which the target page's full-quality fit bitmap is first drawn (a draw callback on the
+  page plus that frame's `FrameMetrics` timing). Placeholder frames do not count. "Cold" = the page is not decoded and
+  not rendered (fresh book or a far jump); "prefetched" = the prefetch and pre-render window is idle before the turn.
+
+The `perf-capture.ps1` method (Perfetto FrameTimeline → `trace_processor_shell` → `framestat`; a frame is janky when
+SurfaceFlinger's `jank_type` is anything other than `None` or `Buffer Stuffing`; the script refuses a row when the
+active refresh rate differs from the expected one or the target produced zero frames) remains in the repository **for
+reference only**. It is not the method for any Phase 2 row; a1's method is revisited when Phase 3 starts.
 
 ## Budgets
 
 | # | Budget | Target | Scenario / corpus file | How measured | When enforced | State |
 |---|---|---|---|---|---|---|
 | a1 | Janky-frame % at locked 120 Hz | ≤ **1 %** | Webtoon scroll — `webtoon-long.cbz` | `perf-capture.ps1 -Action webtoon-scroll` | Phase 3 | approved |
-| a2 | Janky-frame % at locked 120 Hz | ≤ **1 %** | Paged swipe — `mixed-small.cbz` | `perf-capture.ps1 -Action paged-swipe` | Phase 2 | approved |
-| a3 | Janky-frame % at locked 120 Hz | ≤ **1 %** | Pinch-zoom + pan — `screentone.cbz`, `huge-single.cbz` | `perf-capture.ps1 -Action manual` (owner gestures) | Phase 2 | approved |
-| b | Page turn → sharp image | prefetched **< 100 ms**, cold **< 300 ms** | Page turns on `mixed-small.cbz` | Method decided in Phase 2 when the reader exists (frame timing cannot measure it) | Phase 2 | approved |
+| a2 | Janky-frame % at locked 120 Hz | ≤ **1 %** | Paged swipe — `mixed-small.cbz` | Benchmark screen scenario a2 (scripted paged swipe; Phase 2 spec §6.4) | Phase 2 | approved |
+| a3 | Janky-frame % at locked 120 Hz | ≤ **1 %** | Pinch-zoom + pan — `screentone.cbz`, `huge-single.cbz` | Benchmark screen scenario a3 (scripted zoom/pan; Phase 2 spec §6.4) | Phase 2 | approved |
+| b | Page turn → sharp image | prefetched **< 100 ms**, cold **< 300 ms** | Page turns on `mixed-small.cbz` | Benchmark screen scenario b (page-turn latency; t0/t1 in Method above; Phase 2 spec §6.4) | Phase 2 | approved |
 | c | Peak total process PSS | **dropped, no number** | n/a | n/a | n/a | dropped by owner decision 2026-11-19 |
 | d | Open time of a 500-page archive | **dropped, no number** | n/a | n/a | n/a | dropped by owner decision 2026-11-19 |
 
@@ -29,14 +46,15 @@ the expected one before or after the run, or if the target package produced zero
 budget numbers are proposed for peak process PSS (c) or open time of a 500-page archive (d), and no formulas are needed.
 Nothing was measured for them. Rows a1, a2, a3 and b are untouched and remain approved.
 
-**Open conflict (owner decision needed later, not changed here):** a1, a2, a3 and b are defined as reference-device
-measurements (`perf-capture.ps1` on the OnePlus, see Method). The owner's 2026-11-19 instruction that no benchmarks run on the
-real device conflicts with them for Phase 2 and Phase 3, where they are enforced. How, or whether, they will be verified is open.
+**D1/D2 (owner decisions 2026-11-19; replaces the earlier open conflict):** measurement is the **in-app Benchmark screen**
+(D1): the real-device run is a **checkpoint the owner starts** whenever they choose, on any phone, without adb; a budget
+miss found there is fixed in a later round, not a Phase 2 blocker. Phase 2 exit is **functional verification on the
+emulator** (D2); emulator numbers are never performance results. Rows a1, a2, a3 and b keep their targets and stay approved.
 
 Frame-duration percentiles (p50/p90/p95/p99) are recorded for information only, **not** budgeted:
 a pipelined renderer legitimately has frames longer than one vsync.
 
-## Noise floor of the method (measured 2026-11-18, reference device, locked 120 Hz)
+## Noise floor of the `perf-capture.ps1` method (measured 2026-11-18, reference device, locked 120 Hz)
 
 Settings app, 10 scripted swipes (~4 s, ~540–590 frames per run), three runs
 (`scripts/perf-capture.ps1 -Package com.android.settings -Scenario smoke-scroll-runN -Action webtoon-scroll -Repeat 10 -ExpectedHz 120`;

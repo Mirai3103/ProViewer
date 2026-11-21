@@ -2,6 +2,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <application
+        android:name=".ProViewerApp"
         android:allowBackup="false"
         android:label="ProViewer"
         android:supportsRtl="true"
@@ -12,6 +13,17 @@
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:mimeType="application/zip" />
+                <data android:mimeType="application/x-cbz" />
+                <data android:mimeType="application/vnd.comicbook+zip" />
+                <data android:mimeType="application/octet-stream" />
             </intent-filter>
         </activity>
     </application>

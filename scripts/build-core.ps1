@@ -21,6 +21,12 @@ $env:CMAKE_TOOLCHAIN_FILE_x86_64_linux_android = $toolchain
 
 Push-Location $repoRoot
 try {
-    cargo ndk -t arm64-v8a -t x86_64 -o app/src/main/jniLibs build --profile $Profile -p proviewer_core
+    # -P 29 targets the app's minSdk (29). The Task 4 pixel path links AHardwareBuffer_* from
+    # libnativewindow, which only exists at API 26+ (cargo-ndk defaults to 21, where it is absent).
+    cargo ndk -t arm64-v8a -t x86_64 -P 29 -o app/src/main/jniLibs build --profile $Profile -p proviewer_core
     if ($LASTEXITCODE -ne 0) { throw 'cargo ndk build failed' }
+    # Benchmark-only corpus generator: packaged only in the debug/benchmark variants
+    # (app/build/benchJniLibs is wired into those source sets; release never sees it).
+    cargo ndk -t arm64-v8a -t x86_64 -P 29 -o app/build/benchJniLibs build --profile $Profile -p bench-corpus
+    if ($LASTEXITCODE -ne 0) { throw 'cargo ndk build failed (bench-corpus)' }
 } finally { Pop-Location }
