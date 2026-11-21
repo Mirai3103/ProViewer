@@ -97,7 +97,7 @@ class PageWindow(
             }
         }
 
-        renderer.prefetchHint(current, forward, viewW, viewH)
+        renderer.prefetchHint(current, forward, viewW, viewH, mode)
     }
 
     /** Waits until every in-flight render has completed (or failed). */
@@ -125,7 +125,10 @@ class PageWindow(
                 val natural = renderer.knownPageSize(page) ?: renderer.probePageSize(page)
                 val size = baseSize(natural.width, natural.height, spec.viewW, spec.viewH, spec.mode)
                 val display = fitSize(natural.width, natural.height, spec.viewW, spec.viewH, spec.mode)
-                val image = renderer.renderBase(page, size)
+                val image = renderer.renderRegion(
+                    page,
+                    PageRegion(0, 0, natural.width, natural.height, size.width, size.height),
+                )
                 if (closed) {
                     image.release()
                     return@launch

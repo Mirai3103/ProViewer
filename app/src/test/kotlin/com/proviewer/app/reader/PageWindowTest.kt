@@ -22,11 +22,11 @@ import org.junit.Test
 class PageWindowTest {
 
     private class FakeRenderer(override val pageCount: Int) : PageSourceRenderer {
-        /** renderBase start order, with the size each render was asked for. */
+        /** renderRegion start order, with the output size each render was asked for. */
         val started = mutableListOf<Pair<Int, IntSize>>()
         /** renders that completed (returned an image). */
         val completed = mutableListOf<Pair<Int, IntSize>>()
-        /** pages whose renderBase was cancelled mid-flight. */
+        /** pages whose renderRegion was cancelled mid-flight. */
         val cancelled = mutableListOf<Int>()
         /** pages whose Ready image was released. */
         val released = mutableListOf<Int>()
@@ -34,10 +34,14 @@ class PageWindowTest {
         val prefetches = mutableListOf<List<Any>>()
         /** pages that should fail. */
         var failPages: Set<Int> = emptySet()
-        /** when set, renderBase waits on this deferred (controllable completion). */
+        /** when set, renderRegion waits on this deferred (controllable completion). */
         var hold: CompletableDeferred<Unit>? = null
+        /** every region asked for, in start order. */
+        val regions = mutableListOf<Pair<Int, PageRegion>>()
 
-        override suspend fun renderBase(page: Int, size: IntSize): PageImage {
+        override suspend fun renderRegion(page: Int, region: PageRegion): PageImage {
+            val size = IntSize(region.outW, region.outH)
+            regions.add(page to region)
             started.add(page to size)
             try {
                 hold?.await()
@@ -69,8 +73,8 @@ class PageWindowTest {
             return natural(page)
         }
 
-        override fun prefetchHint(current: Int, forward: Boolean, viewW: Int, viewH: Int) {
-            prefetches.add(listOf(current, forward, viewW, viewH))
+        override fun prefetchHint(current: Int, forward: Boolean, viewW: Int, viewH: Int, mode: FitMode) {
+            prefetches.add(listOf(current, forward, viewW, viewH, mode))
         }
     }
 
@@ -85,7 +89,9 @@ class PageWindowTest {
         assertEquals(listOf(5, 6, 7, 8, 4), renderer.started.map { it.first })
         assertEquals(5, window.pages.size)
         assertTrue(window.pages.values.all { it is PageSlot.Ready })
-        assertEquals(listOf(5, true, 1080, 2378), renderer.prefetches.single())
+        assertEquals(listOf(5, true, 1080, 2378, FitMode.Screen), renderer.prefetches.single())
+        // Each render asks for the whole page (natural 100x150) at its base size.
+        assertTrue(renderer.regions.all { (_, r) -> r.x == 0 && r.y == 0 && r.w == 100 && r.h == 150 })
     }
 
     @Test
@@ -234,5 +240,20 @@ class PageWindowTest {
         window.update(0, forward = true, viewW = 1080, viewH = 2378, mode = FitMode.Width)
         advanceUntilIdle()
         assertEquals(1, renderer.started.size)
+    }
+
+    @Test
+    fun prefetch_hint_carries_the_fit_mode() = runTest {
+        val renderer = FakeRenderer(pageCount = 20)
+        val window = PageWindow(this, renderer, ahead = 3, behind = 1)
+
+        window.update(5, forward = false, viewW = 540, viewH = 1189, mode = FitMode.Width)
+        window.update(5, forward = false, viewW = 540, viewH = 1189, mode = FitMode.Height)
+        advanceUntilIdle()
+
+        assertEquals(
+            listOf(listOf(5, false, 540, 1189, FitMode.Width), listOf(5, false, 540, 1189, FitMode.Height)),
+            renderer.prefetches,
+        )
     }
 }

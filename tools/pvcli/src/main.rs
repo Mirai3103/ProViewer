@@ -3,7 +3,7 @@
 mod mem;
 
 use proviewer_core::engine::{
-    fit_size, Book, CancelToken, Engine, EngineConfig, ReadDirection, TileRequest,
+    fit_size, Book, CancelToken, Engine, EngineConfig, FitTarget, ReadDirection, TileRequest,
 };
 use proviewer_core::error::EngineError;
 use proviewer_core::resize::Rect;
@@ -312,7 +312,13 @@ fn run_read(opts: &ReadOpts, out: &mut dyn Write, err: &mut dyn Write) -> Result
     let mut samples: Vec<f64> = Vec::new();
     let mut failed = 0;
     for page in 0..n {
-        book.prefetch_hint(page, ReadDirection::Forward, opts.fit.0, opts.fit.1);
+        book.prefetch_hint(
+            page,
+            ReadDirection::Forward,
+            opts.fit.0,
+            opts.fit.1,
+            FitTarget::Screen,
+        );
         let hits_before = engine.stats().cache_hits;
         let t = Instant::now();
         let result = render_fit(&book, page, opts.fit, &mut buf);

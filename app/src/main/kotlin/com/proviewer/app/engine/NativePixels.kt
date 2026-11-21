@@ -38,6 +38,37 @@ object NativePixels {
         cancel: Long,
     )
 
+    /**
+     * Renders the `w x h` rectangle at `(x, y)` of [page] scaled as a whole to `fullW x fullH`
+     * into [bitmap], which must be exactly `w x h` and `ARGB_8888`.
+     */
+    external fun renderScaledToBitmap(
+        book: Long,
+        page: Int,
+        fullW: Int,
+        fullH: Int,
+        x: Int,
+        y: Int,
+        w: Int,
+        h: Int,
+        bitmap: Bitmap,
+        cancel: Long,
+    )
+
+    /** As [renderScaledToBitmap] into a `w x h` `RGBA_8888` [buffer] with CPU-write usage. */
+    external fun renderScaledToHardwareBuffer(
+        book: Long,
+        page: Int,
+        fullW: Int,
+        fullH: Int,
+        x: Int,
+        y: Int,
+        w: Int,
+        h: Int,
+        buffer: HardwareBuffer,
+        cancel: Long,
+    )
+
     external fun newCancelToken(): Long
 
     external fun cancel(token: Long)

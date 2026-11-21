@@ -3,12 +3,15 @@ package com.proviewer.app.engine
 import android.graphics.Bitmap
 import android.graphics.ColorSpace
 import android.hardware.HardwareBuffer
+import androidx.compose.ui.unit.IntRect
 import androidx.compose.ui.unit.IntSize
+import com.proviewer.app.reader.FitMode
 import com.proviewer.app.reader.PageRegion
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import uniffi.proviewer_core.FitTarget
 import uniffi.proviewer_core.ReadDirection
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -66,7 +69,8 @@ interface PageSourceRenderer {
     /** Number of pages in the book. */
     val pageCount: Int
 
-    suspend fun renderBase(page: Int, size: IntSize): PageImage
+    /** Renders [region] of [page] to exactly `region.outW x region.outH` (see [PageRenderer.render]). */
+    suspend fun renderRegion(page: Int, region: PageRegion): PageImage
 
     /** The natural size of [page] if it was already probed, else null. Never blocks; main-safe. */
     fun knownPageSize(page: Int): IntSize?
@@ -77,7 +81,22 @@ interface PageSourceRenderer {
      */
     suspend fun probePageSize(page: Int): IntSize
 
-    fun prefetchHint(current: Int, forward: Boolean, viewW: Int, viewH: Int)
+    /** Hints the engine to decode the pages around [current] at the size a [mode] fit render uses. Main-safe. */
+    fun prefetchHint(current: Int, forward: Boolean, viewW: Int, viewH: Int, mode: FitMode)
+}
+
+/**
+ * Renders tiles of a page scaled as a whole to a virtual `full` size; the Webtoon tile manager renders
+ * through it, faked in JVM tests. [PageRenderer] is the production implementation.
+ */
+interface TileSource {
+    /**
+     * Renders the [rect] (in `full` output pixels, inside `0,0,full.width,full.height`) of [page]
+     * scaled as a whole to [full], into a target of exactly `rect.width x rect.height`. Adjacent
+     * tiles of one [full] size match the corresponding pixels of a single render of both within one
+     * channel level, with no gap or overlap. The caller releases the returned image.
+     */
+    suspend fun renderScaled(page: Int, full: IntSize, rect: IntRect): PageImage
 }
 
 /**
@@ -88,7 +107,7 @@ interface PageSourceRenderer {
 class PageRenderer(
     private val book: NativeBook,
     @Volatile var strategy: UploadStrategy,
-) : PageSourceRenderer {
+) : PageSourceRenderer, TileSource {
 
     /** True once a hardware render has fallen back to software (alloc/wrap failure). */
     @Volatile var fellBack: Boolean = false
@@ -110,23 +129,65 @@ class PageRenderer(
     /**
      * Renders [region] of [page] to a target of exactly `region.outW x region.outH`. Runs off the
      * caller's dispatcher; the caller (PageWindow) is responsible for releasing the returned image.
+     */
+    suspend fun render(page: Int, region: PageRegion): PageImage =
+        renderInto(
+            IntSize(region.outW, region.outH),
+            software = { bitmap, token ->
+                NativePixels.renderToBitmap(book.handle, page, region.x, region.y, region.w, region.h, bitmap, token)
+            },
+            hardware = { buffer, token ->
+                NativePixels.renderToHardwareBuffer(
+                    book.handle, page, region.x, region.y, region.w, region.h, buffer, token,
+                )
+            },
+        )
+
+    override suspend fun renderRegion(page: Int, region: PageRegion): PageImage = render(page, region)
+
+    override suspend fun renderScaled(page: Int, full: IntSize, rect: IntRect): PageImage =
+        renderInto(
+            IntSize(rect.width, rect.height),
+            software = { bitmap, token ->
+                NativePixels.renderScaledToBitmap(
+                    book.handle, page, full.width, full.height,
+                    rect.left, rect.top, rect.width, rect.height, bitmap, token,
+                )
+            },
+            hardware = { buffer, token ->
+                NativePixels.renderScaledToHardwareBuffer(
+                    book.handle, page, full.width, full.height,
+                    rect.left, rect.top, rect.width, rect.height, buffer, token,
+                )
+            },
+        )
+
+    /**
+     * The shared target path of [render] and [renderScaled]: allocates a [size] target for the
+     * current [strategy] (hardware falling back to software on alloc/wrap failure), runs the
+     * blocking native call on [dispatcher] with a fresh cancel token, and releases the token in
+     * `finally`.
      *
      * `withContext` has a prompt cancellation guarantee: if the caller is cancelled after the
      * render finished but before the result is handed back, `withContext` throws and drops the
-     * value. The finished image is therefore tracked in [produced] and released on that path, so
+     * value. The finished image is therefore tracked in `produced` and released on that path, so
      * no bitmap or hardware buffer is ever orphaned.
      */
-    suspend fun render(page: Int, region: PageRegion): PageImage {
+    private suspend fun renderInto(
+        size: IntSize,
+        software: (Bitmap, Long) -> Unit,
+        hardware: (HardwareBuffer, Long) -> Unit,
+    ): PageImage {
         var produced: PageImage? = null
         try {
             return withContext(dispatcher) {
                 val token = NativePixels.newCancelToken()
                 val image = try {
                     when (strategy) {
-                        UploadStrategy.Software -> renderSoftware(page, region, token)
-                        UploadStrategy.Hardware -> renderHardware(page, region, token) ?: run {
+                        UploadStrategy.Software -> renderSoftware(size, token, software)
+                        UploadStrategy.Hardware -> renderHardware(size, token, hardware) ?: run {
                             fellBack = true
-                            renderSoftware(page, region, token)
+                            renderSoftware(size, token, software)
                         }
                     }
                 } finally {
@@ -143,11 +204,6 @@ class PageRenderer(
 
     override val pageCount: Int get() = book.pageCount
 
-    override suspend fun renderBase(page: Int, size: IntSize): PageImage {
-        val natural = probePageSize(page)
-        return render(page, PageRegion(0, 0, natural.width, natural.height, size.width, size.height))
-    }
-
     override fun knownPageSize(page: Int): IntSize? =
         book.cachedPageInfo(page)?.let { IntSize(it.width.toInt(), it.height.toInt()) }
 
@@ -157,21 +213,24 @@ class PageRenderer(
             IntSize(info.width.toInt(), info.height.toInt())
         }
 
-    override fun prefetchHint(current: Int, forward: Boolean, viewW: Int, viewH: Int) {
+    override fun prefetchHint(current: Int, forward: Boolean, viewW: Int, viewH: Int, mode: FitMode) {
         book.book.prefetchHint(
             current.toUInt(),
             if (forward) ReadDirection.FORWARD else ReadDirection.BACKWARD,
             viewW.toUInt(),
             viewH.toUInt(),
+            when (mode) {
+                FitMode.Screen -> FitTarget.SCREEN
+                FitMode.Width -> FitTarget.WIDTH
+                FitMode.Height -> FitTarget.HEIGHT
+            },
         )
     }
 
-    private suspend fun renderSoftware(page: Int, region: PageRegion, token: Long): PageImage {
-        val bitmap = Bitmap.createBitmap(region.outW, region.outH, Bitmap.Config.ARGB_8888)
+    private suspend fun renderSoftware(size: IntSize, token: Long, nativeCall: (Bitmap, Long) -> Unit): PageImage {
+        val bitmap = Bitmap.createBitmap(size.width, size.height, Bitmap.Config.ARGB_8888)
         try {
-            cancellableRender(token) {
-                NativePixels.renderToBitmap(book.handle, page, region.x, region.y, region.w, region.h, bitmap, token)
-            }
+            cancellableRender(token) { nativeCall(bitmap, token) }
             return SoftwarePageImage(bitmap)
         } catch (e: Throwable) {
             bitmap.recycle()
@@ -184,13 +243,17 @@ class PageRenderer(
      * allocation or wrapping fails, so the caller can fall back to software. A render failure is
      * rethrown (never silently downgraded).
      */
-    private suspend fun renderHardware(page: Int, region: PageRegion, token: Long): PageImage? {
+    private suspend fun renderHardware(
+        size: IntSize,
+        token: Long,
+        nativeCall: (HardwareBuffer, Long) -> Unit,
+    ): PageImage? {
         // create() is @NonNull: it throws (IllegalArgumentException) rather than returning null
         // when the buffer cannot be allocated.
         val buffer = try {
             HardwareBuffer.create(
-                region.outW,
-                region.outH,
+                size.width,
+                size.height,
                 HardwareBuffer.RGBA_8888,
                 1,
                 HardwareBuffer.USAGE_CPU_WRITE_OFTEN or HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE,
@@ -210,11 +273,7 @@ class PageRenderer(
             } ?: return null // wrap failed; finally closes the buffer
             bitmap = wrapped
             onTargetAllocated?.invoke()
-            cancellableRender(token) {
-                NativePixels.renderToHardwareBuffer(
-                    book.handle, page, region.x, region.y, region.w, region.h, buffer, token,
-                )
-            }
+            cancellableRender(token) { nativeCall(buffer, token) }
             delivered = true
             return HardwarePageImage(buffer, wrapped) { openBuffers.decrementAndGet() }
         } finally {

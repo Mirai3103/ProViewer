@@ -53,7 +53,7 @@ pub fn webtoon_strip(width: u32, height: u32) -> GrayImage {
         }
         // Fine 1 px diagonal hatching whose spacing varies per panel.
         let spacing = 3 + (cell % 5);
-        let hatch = (x + ly) % spacing == 0;
+        let hatch = (x + ly).is_multiple_of(spacing);
         // Smooth tone ramp across the panel.
         let ramp = 120 + (135 * ly / panel_h) as u8 / 2;
         Luma([if hatch { 20 } else { ramp }])
@@ -68,7 +68,7 @@ fn simple_page(width: u32, height: u32, index: u32) -> GrayImage {
             return Luma([0]);
         }
         let band = y * 12 / height.max(1);
-        let hatch = (x + y + index) % (4 + band % 4) == 0;
+        let hatch = (x + y + index).is_multiple_of(4 + band % 4);
         let bar = x < (width * ((index % 10) + 1) / 10)
             && y + 3 * m + 1 > height
             && y + 2 * m < height;

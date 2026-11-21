@@ -21,6 +21,12 @@ pub struct HandleRegistry<T> {
     entries: Mutex<Vec<(u64, Arc<T>)>>,
 }
 
+impl<T> Default for HandleRegistry<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T> HandleRegistry<T> {
     pub fn new() -> Self {
         HandleRegistry {
