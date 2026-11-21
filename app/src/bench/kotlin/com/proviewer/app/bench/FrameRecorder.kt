@@ -8,16 +8,19 @@ import android.view.Window
 
 /**
  * Collects per-frame timing samples from a [Window] for the benchmark (Task 9). Start before the
- * frames of interest and stop to get the collected samples. The `INTENDED_VSYNC_TIME_NS` and
- * `DEADLINE_TIME_NS` metrics only exist since API 31, so on older devices nothing is registered
- * and [stop] returns an empty list.
+ * frames of interest and stop to get the collected samples. The recorder is reusable across
+ * start/stop cycles (the runner holds one recorder and cycles it per scenario): each [start]
+ * creates a fresh private [HandlerThread] and [stop] tears it down, and [stop] returns only the
+ * samples collected since its own [start]. The [FrameMetrics.INTENDED_VSYNC_TIMESTAMP] and
+ * [FrameMetrics.DEADLINE] metrics only exist since API 31, so on older devices nothing is
+ * registered and [stop] returns an empty list.
  */
 class FrameRecorder(private val window: Window) {
 
     /** Frame metrics needed by the benchmark exist only since Android 12 (API 31). */
     val supported: Boolean = Build.VERSION.SDK_INT >= 31
 
-    private val thread = HandlerThread("FrameRecorder")
+    private var thread: HandlerThread? = null
     private val collected = mutableListOf<FrameSample>()
     private var handler: Handler? = null
     private var running = false
@@ -35,21 +38,33 @@ class FrameRecorder(private val window: Window) {
         }
     }
 
-    /** Registers the frame metrics listener on a private handler thread; no-op when unsupported. */
+    /**
+     * Registers the frame metrics listener on a private handler thread; no-op when unsupported
+     * or already running. A Java thread cannot be restarted after termination, so a fresh thread
+     * is created per start rather than checking the previous one's isAlive: right after [stop]
+     * that thread is quitting but may still report alive, and posting frame callbacks to a
+     * quitting looper would silently drop them all.
+     */
     fun start() {
         if (!supported || running) return
-        thread.start()
+        thread?.quitSafely() // no-op unless a previous start() failed midway and left one idle
+        val thread = HandlerThread("FrameRecorder").also { it.start() }
+        this.thread = thread
         handler = Handler(thread.looper)
         window.addOnFrameMetricsAvailableListener(listener, handler!!)
         running = true
     }
 
-    /** Unregisters the listener and returns the collected samples in arrival order. */
+    /**
+     * Unregisters the listener, tears down the handler thread, and returns the samples collected
+     * since [start] in arrival order, clearing them so the next cycle starts empty.
+     */
     fun stop(): List<FrameSample> {
         if (running) {
             window.removeOnFrameMetricsAvailableListener(listener)
             handler = null
-            thread.quitSafely()
+            thread?.quitSafely()
+            thread = null
             running = false
         }
         return synchronized(collected) {
