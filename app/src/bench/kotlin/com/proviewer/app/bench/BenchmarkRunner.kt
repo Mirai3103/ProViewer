@@ -296,16 +296,16 @@ class BenchmarkRunner(
         while (true) {
             val settled = vm.state != null &&
                 vm.viewport != null &&
-                vm.window?.pages?.get(0) is PageSlot.Ready &&
+                vm.window?.wholeSlot(0) is PageSlot.Ready &&
                 probe.hasSharpDraw(0)
             if (settled) {
                 vm.window?.awaitIdle()
-                if (vm.window?.pages?.get(0) is PageSlot.Ready) return
+                if (vm.window?.wholeSlot(0) is PageSlot.Ready) return
             }
             if (SystemClock.elapsedRealtime() >= deadline) {
                 throw IllegalStateException(
                     "reader never became ready: state=${vm.state}, viewport=${vm.viewport}, " +
-                        "slot=${vm.window?.pages?.get(0)}",
+                        "slot=${vm.window?.wholeSlot(0)}",
                 )
             }
             delay(READY_POLL_MS)

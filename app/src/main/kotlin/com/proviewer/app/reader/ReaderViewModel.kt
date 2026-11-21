@@ -4,6 +4,7 @@ import android.net.Uri
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.unit.IntSize
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -52,6 +53,13 @@ class ReaderViewModel : ViewModel() {
         private set
     internal var window: PageWindow? = null
         private set
+    internal var budget: ImageBudget? = null
+        private set
+    internal var sizes: PageSizes? = null
+        private set
+
+    /** Re-runs [scheduleWindowUpdate] whenever [PageSizes.version] changes. */
+    private var sizesJob: Job? = null
 
     private var viewW = 0
     private var viewH = 0
@@ -129,10 +137,19 @@ class ReaderViewModel : ViewModel() {
         releaseResources()
         val book = opened.book
         val renderer = PageRenderer(book, strategy)
-        val window = PageWindow(viewModelScope, renderer)
+        val budget = ImageBudget()
+        val window = PageWindow(viewModelScope, renderer, budget)
+        val sizes = PageSizes(viewModelScope, renderer)
         this.book = book
         this.renderer = renderer
+        this.budget = budget
         this.window = window
+        this.sizes = sizes
+        // Page sizes arrive in the background; every batch of them can unlock more window targets.
+        sizesJob = viewModelScope.launch {
+            snapshotFlow { sizes.version }.collect { scheduleWindowUpdate() }
+        }
+        sizes.start()
         state = ReaderState(
             title = opened.title,
             page = 0,
@@ -226,14 +243,29 @@ class ReaderViewModel : ViewModel() {
             val h = viewH
             if (w <= 0 || h <= 0) return@launch
             val window = window ?: return@launch
-            window.update(s.page, s.direction == Direction.Ltr, w, h, s.fitMode)
+            val renderer = renderer ?: return@launch
+            val sizes = sizes ?: return@launch
+            val forward = s.direction == Direction.Ltr
+            // Temporary one-page-per-unit driving of the part-keyed window (the unit pager is Task 5).
+            val sizeOf = { page: Int -> sizes.known(page) ?: renderer.knownPageSize(page) }
+            sizes.prioritize(windowPages(s.page, s.count, WINDOW_AHEAD, WINDOW_BEHIND, forward))
+            val units = buildUnits(s.count, sizeOf, Layout.Single, SplitChoice.Off, s.direction, shift = false)
+            val targets = windowTargets(units, s.page, WINDOW_AHEAD, WINDOW_BEHIND, forward) { unit ->
+                unitGeometry(unit, sizeOf, w, h, s.fitMode, s.direction)
+            }
+            window.update(targets, PrefetchRequest(s.page, forward, w, h, s.fitMode))
         }
     }
 
     private fun releaseResources() {
+        sizesJob?.cancel()
+        sizesJob = null
+        sizes?.close()
+        sizes = null
         val window = this.window
         this.window = null
         window?.close()
+        budget = null
         val book = this.book
         this.book = null
         this.renderer = null
@@ -243,3 +275,7 @@ class ReaderViewModel : ViewModel() {
         }
     }
 }
+
+/** Pages kept rendered ahead of / behind the current one. */
+private const val WINDOW_AHEAD = 3
+private const val WINDOW_BEHIND = 1

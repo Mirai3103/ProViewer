@@ -169,7 +169,7 @@ private fun PageSlotView(
     probe: ReaderProbe,
     onZoom: (ZoomAutomation?) -> Unit,
 ) {
-    val slot = vm.window?.pages?.get(page)
+    val slot = vm.window?.wholeSlot(page)
     val slotSize = remember { mutableStateOf(IntSize.Zero) }
     // Telephoto 0.19.0 captures zoomable's onClick once (its tap node only swaps the handler when
     // the parameter's nullability flips), so the handler must resolve the live values itself

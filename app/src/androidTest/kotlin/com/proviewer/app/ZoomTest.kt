@@ -143,7 +143,7 @@ class ZoomTest {
         while (System.currentTimeMillis() < deadline) {
             composeRule.waitForIdle()
             val view = readerVm.viewport!!
-            val ready = (readerVm.window?.pages?.get(page) as? PageSlot.Ready)?.size
+            val ready = (readerVm.window?.wholeSlot(page) as? PageSlot.Ready)?.size
             if (view == lastViewport && ready == baseSize(pageW, pageH, view.width, view.height, FitMode.Screen)) {
                 return checkNotNull(ready)
             }
@@ -151,7 +151,7 @@ class ZoomTest {
             Thread.sleep(200)
         }
         throw AssertionError(
-            "page $page never settled; viewport=$lastViewport slot=${readerVm.window?.pages?.get(page)}",
+            "page $page never settled; viewport=$lastViewport slot=${readerVm.window?.wholeSlot(page)}",
         )
     }
 
@@ -168,7 +168,7 @@ class ZoomTest {
         contentLeft: Float,
         contentTop: Float,
     ): PageRegion {
-        val slot = readerVm.window!!.pages[page] as PageSlot.Ready
+        val slot = readerVm.window!!.wholeSlot(page) as PageSlot.Ready
         val info = readerVm.book!!.pageInfo(page)
         val view = readerVm.viewport!!
         return checkNotNull(
@@ -375,7 +375,7 @@ class ZoomTest {
         val info = readerVm.book!!.pageInfo(0)
         val pageW = info.width.toInt()
         val pageH = info.height.toInt()
-        val base = (readerVm.window!!.pages[0] as PageSlot.Ready).size
+        val base = (readerVm.window!!.wholeSlot(0) as PageSlot.Ready).size
         val maxZoom = max(4f, pageW / base.width.toFloat())
 
         // Zoom far past the limit; the state coerces to the spec maximum.

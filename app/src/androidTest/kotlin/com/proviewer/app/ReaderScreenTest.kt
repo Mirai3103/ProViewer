@@ -96,7 +96,7 @@ class ReaderScreenTest {
     }
 
     private fun readySize(vm: ReaderViewModel, page: Int): IntSize? =
-        (vm.window?.pages?.get(page) as? PageSlot.Ready)?.size
+        (vm.window?.wholeSlot(page) as? PageSlot.Ready)?.size
 
     private fun waitReadySize(vm: ReaderViewModel, page: Int, expected: IntSize, timeout: Long = 30_000) {
         composeRule.waitUntil(timeout) { readySize(vm, page) == expected }
@@ -105,12 +105,12 @@ class ReaderScreenTest {
     private fun waitReady(vm: ReaderViewModel, page: Int): IntSize {
         val deadline = System.currentTimeMillis() + 30_000
         while (System.currentTimeMillis() < deadline) {
-            val slot = vm.window?.pages?.get(page)
+            val slot = vm.window?.wholeSlot(page)
             if (slot is PageSlot.Ready) return slot.size
             composeRule.waitForIdle()
             Thread.sleep(25)
         }
-        val slot = vm.window?.pages?.get(page)
+        val slot = vm.window?.wholeSlot(page)
         throw AssertionError("page $page never became Ready; slot=$slot, state=${vm.state}")
     }
 
@@ -338,7 +338,7 @@ class ReaderScreenTest {
             waitReady(vm, 0)
 
             // The corrupt page (1) is rendered as a Failed slot in the prefetch window.
-            composeRule.waitUntil(10_000) { vm.window?.pages?.get(1) is PageSlot.Failed }
+            composeRule.waitUntil(10_000) { vm.window?.wholeSlot(1) is PageSlot.Failed }
 
             // Navigate to it: the placeholder must be shown.
             goTo(vm, 1)
@@ -477,7 +477,7 @@ class ReaderScreenTest {
             while (System.currentTimeMillis() < deadline && ready == null) {
                 composeRule.waitForIdle()
                 val view = readerVm.viewport!!
-                val slot = readerVm.window?.pages?.get(0) as? PageSlot.Ready
+                val slot = readerVm.window?.wholeSlot(0) as? PageSlot.Ready
                 if (view == lastViewport && readerVm.state?.fitMode == mode && slot != null &&
                     slot.size == baseSize(w, h, view.width, view.height, mode)
                 ) {
@@ -487,7 +487,7 @@ class ReaderScreenTest {
                 if (ready == null) Thread.sleep(200)
             }
             val slot = checkNotNull(ready) {
-                "page never became Ready for $mode; viewport=$lastViewport slot=${readerVm.window?.pages?.get(0)}"
+                "page never became Ready for $mode; viewport=$lastViewport slot=${readerVm.window?.wholeSlot(0)}"
             }
             assertEquals("the fit must not be memory-capped for this test", slot.size, slot.display)
             composeRule.waitForIdle()
