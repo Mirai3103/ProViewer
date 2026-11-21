@@ -25,6 +25,44 @@ class BenchMathTest {
         firstDraw = firstDraw,
     )
 
+    // --- vendor workarounds ---------------------------------------------------
+
+    private val vendorOffsetNs = 1_446_913_000_000_000L
+
+    @Test
+    fun normalize_strips_the_whole_second_offset_from_total_and_deadline() {
+        val raw = FrameSample(
+            intendedVsyncNs = 123L,
+            totalNs = vendorOffsetNs + 3_978_688L,
+            deadlineNs = vendorOffsetNs + 12_271_592L,
+            firstDraw = false,
+        )
+        val n = normalizeFrameSample(raw)
+        assertEquals(3_978_688L, n.totalNs)
+        assertEquals(12_271_592L, n.deadlineNs)
+        assertEquals(123L, n.intendedVsyncNs)
+    }
+
+    @Test
+    fun normalize_leaves_healthy_samples_untouched() {
+        val s = sample(totalMs = 4.0, deadlineMs = 16.0)
+        assertEquals(s, normalizeFrameSample(s))
+    }
+
+    @Test
+    fun jank_summary_replaces_non_positive_deadlines_with_the_median_valid_one() {
+        val samples = buildList {
+            repeat(9) { add(sample(totalMs = 4.0, deadlineMs = 12.0)) }
+            // 4 ms frame with a bogus negative deadline: must not count as janky.
+            add(sample(totalMs = 4.0, deadlineMs = -171.0))
+            // A genuinely slow frame with a bogus deadline is still caught (20 > 12).
+            add(sample(totalMs = 20.0, deadlineMs = -87.0))
+        }
+        val s = jankSummary(samples)
+        assertEquals(1, s.janky)
+        assertEquals(2, s.deadlineFallbacks)
+    }
+
     // --- jankSummary ----------------------------------------------------------
 
     @Test

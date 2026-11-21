@@ -13,6 +13,16 @@ data class FrameSample(
     val totalNs: Long,
     val deadlineNs: Long,
     val firstDraw: Boolean,
+    /** Diagnostic: every other FrameMetrics value, in [RAW_METRIC_NAMES] order. */
+    val raw: List<Long> = emptyList(),
+)
+
+/** Names of [FrameSample.raw] entries, emitted next to the samples in the JSON. */
+val RAW_METRIC_NAMES = listOf(
+    "INTENDED_VSYNC_TIMESTAMP", "VSYNC_TIMESTAMP", "TOTAL_DURATION", "DEADLINE",
+    "INPUT_HANDLING_DURATION", "ANIMATION_DURATION", "LAYOUT_MEASURE_DURATION", "DRAW_DURATION",
+    "SYNC_DURATION", "COMMAND_ISSUE_DURATION", "SWAP_BUFFERS_DURATION", "GPU_DURATION",
+    "UNKNOWN_DELAY_DURATION", "FIRST_DRAW_FRAME",
 )
 
 /** Jank statistics over the considered (non-first-draw) frames of a scenario run. */
@@ -23,7 +33,27 @@ data class JankSummary(
     val p50Ms: Double,
     val p95Ms: Double,
     val p99Ms: Double,
+    /** Diagnostic: raw metrics of the first few considered frames (see [RAW_METRIC_NAMES]). */
+    val debugSamples: List<List<Long>> = emptyList(),
+    /** Frames whose reported deadline was not positive and was replaced (see [jankSummary]). */
+    val deadlineFallbacks: Int = 0,
 )
+
+private const val IMPLAUSIBLE_TOTAL_NS = 1_000_000_000_000L // 1000 s: no real frame takes this long
+private const val OFFSET_QUANTUM_NS = 1_000_000_000L
+
+/**
+ * Works around a vendor bug seen on a vivo V2364A (Android 15): `TOTAL_DURATION` and `DEADLINE`
+ * both carry the same constant offset of ~1.4469e15 ns (whole seconds plus well under 1 ms of
+ * noise). When [FrameSample.totalNs] is implausibly large, the whole-second part of it is
+ * subtracted from both fields; the remainder is the real duration to within ~1 ms. Samples from
+ * healthy devices pass through untouched.
+ */
+fun normalizeFrameSample(s: FrameSample): FrameSample {
+    if (s.totalNs < IMPLAUSIBLE_TOTAL_NS) return s
+    val offset = s.totalNs / OFFSET_QUANTUM_NS * OFFSET_QUANTUM_NS
+    return s.copy(totalNs = s.totalNs - offset, deadlineNs = s.deadlineNs - offset)
+}
 
 /** Frame-load latency statistics in milliseconds (Task 10 feeds it the measured waits). */
 data class LatencySummary(
@@ -43,7 +73,12 @@ fun jankSummary(samples: List<FrameSample>): JankSummary {
     if (considered.isEmpty()) {
         return JankSummary(frames = 0, janky = 0, jankyPct = 0.0, p50Ms = 0.0, p95Ms = 0.0, p99Ms = 0.0)
     }
-    val janky = considered.count { it.totalNs > it.deadlineNs }
+    // Some devices report a negative/zero deadline for frames that follow an idle gap, which would
+    // count a 3 ms frame as janky. Such frames use the median of the run's valid deadlines instead.
+    val validDeadlines = considered.map { it.deadlineNs }.filter { it > 0 }.sorted()
+    val fallbackDeadline = validDeadlines.getOrNull(validDeadlines.size / 2) ?: DEFAULT_DEADLINE_NS
+    val fallbacks = considered.count { it.deadlineNs <= 0 }
+    val janky = considered.count { it.totalNs > (if (it.deadlineNs > 0) it.deadlineNs else fallbackDeadline) }
     val totalsMs = considered.map { it.totalNs / 1_000_000.0 }
     return JankSummary(
         frames = considered.size,
@@ -52,8 +87,13 @@ fun jankSummary(samples: List<FrameSample>): JankSummary {
         p50Ms = nearestRankPercentile(totalsMs, 50.0),
         p95Ms = nearestRankPercentile(totalsMs, 95.0),
         p99Ms = nearestRankPercentile(totalsMs, 99.0),
+        debugSamples = (considered.take(4) + considered.takeLast(4)).map { it.raw },
+        deadlineFallbacks = fallbacks,
     )
 }
+
+/** 60 Hz frame budget, used only when a run has no valid deadline at all. */
+private const val DEFAULT_DEADLINE_NS = 16_666_667L
 
 /**
  * The end timestamp (`intendedVsyncNs + totalNs`) of the first frame in [frames] whose interval

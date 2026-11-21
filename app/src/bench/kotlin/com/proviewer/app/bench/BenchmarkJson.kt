@@ -93,6 +93,11 @@ private fun jankJson(j: JankSummary): JSONObject = JSONObject().apply {
     put("p50Ms", j.p50Ms)
     put("p95Ms", j.p95Ms)
     put("p99Ms", j.p99Ms)
+    if (j.deadlineFallbacks > 0) put("deadlineFallbacks", j.deadlineFallbacks)
+    if (j.debugSamples.isNotEmpty()) {
+        put("debugSampleFields", JSONArray(RAW_METRIC_NAMES))
+        put("debugSamples", JSONArray().apply { j.debugSamples.forEach { put(JSONArray(it)) } })
+    }
 }
 
 private fun latencyJson(l: LatencySummary): JSONObject = JSONObject().apply {

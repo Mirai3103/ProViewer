@@ -1,8 +1,9 @@
 package com.proviewer.app.bench
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.ContextWrapper
-import android.content.Intent
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -31,16 +32,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
-import androidx.core.content.FileProvider
 import com.proviewer.app.reader.LocalReaderProbe
 import com.proviewer.app.reader.ReaderScreen
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import java.io.File
 
 private const val TAG = "BenchmarkScreen"
 
@@ -49,8 +46,8 @@ private const val THERMAL_REASON = "Device is too warm — wait for it to cool d
 
 /**
  * The Benchmark screen (Task 10): a Start button (disabled with the reason while the thermal check
- * fails), live progress, a results table per scenario x strategy, and JSON sharing through a
- * FileProvider. While a scenario runs, the host composable puts the REAL ReaderScreen on top,
+ * fails), live progress, a results table per scenario x strategy, and a Copy JSON button (system
+ * clipboard). While a scenario runs, the host composable puts the REAL ReaderScreen on top,
  * full screen.
  *
  * The screen owns the runner for its composition lifetime; [runner] lets tests inject one built
@@ -72,7 +69,9 @@ fun BenchmarkScreen(
     val result by owned.result.collectAsState()
     var progress by remember { mutableStateOf("Idle") }
     var thermalReason by remember { mutableStateOf<String?>(null) }
-    var sharing by remember { mutableStateOf(false) }
+    var copied by remember { mutableStateOf(false) }
+    // A new result invalidates the "Copied" label.
+    LaunchedEffect(result) { copied = false }
 
     // The thermal status can change at any moment; re-check periodically so the Start button and
     // its reason stay current. The first check runs before the first frame.
@@ -124,21 +123,14 @@ fun BenchmarkScreen(
             result?.let { ResultsTable(it) }
             Button(
                 onClick = {
-                    val current = result
-                    if (current != null) {
-                        scope.launch {
-                            sharing = true
-                            try {
-                                shareResult(activity, current)
-                            } finally {
-                                sharing = false
-                            }
-                        }
+                    result?.let {
+                        copyResult(activity, it)
+                        copied = true
                     }
                 },
-                enabled = result != null && !sharing,
-                modifier = Modifier.testTag("bench-share"),
-            ) { Text("Share JSON") }
+                enabled = result != null,
+                modifier = Modifier.testTag("bench-copy"),
+            ) { Text(if (copied) "Copied" else "Copy JSON") }
         }
         BenchmarkReaderHost(owned)
     }
@@ -194,22 +186,10 @@ private fun ResultsTable(result: BenchmarkResult) {
     }
 }
 
-/**
- * Writes the run's JSON to `filesDir/bench/result-<timestamp>.json` and shares it through the
- * `${applicationId}.benchfiles` FileProvider with ACTION_SEND, type application/json.
- */
-private suspend fun shareResult(activity: ComponentActivity, result: BenchmarkResult) {
-    val file = withContext(Dispatchers.IO) {
-        val dir = File(activity.filesDir, "bench").apply { mkdirs() }
-        File(dir, "result-${System.currentTimeMillis()}.json").apply { writeText(toJson(result)) }
-    }
-    val uri = FileProvider.getUriForFile(activity, "${activity.packageName}.benchfiles", file)
-    val send = Intent(Intent.ACTION_SEND).apply {
-        type = "application/json"
-        putExtra(Intent.EXTRA_STREAM, uri)
-        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-    }
-    activity.startActivity(Intent.createChooser(send, "Share benchmark JSON"))
+/** Copies the run's JSON to the system clipboard as plain text. */
+private fun copyResult(activity: ComponentActivity, result: BenchmarkResult) {
+    val clipboard = activity.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+    clipboard.setPrimaryClip(ClipData.newPlainText("benchmark-result", toJson(result)))
 }
 
 private tailrec fun Context.findComponentActivity(): ComponentActivity? = when (this) {

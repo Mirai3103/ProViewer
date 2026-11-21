@@ -29,11 +29,14 @@ class FrameRecorder(private val window: Window) {
     // FrameSample immediately. Calls arrive on [handler]; [collected] is guarded for stop().
     private val listener = Window.OnFrameMetricsAvailableListener { _, frameMetrics, _ ->
         synchronized(collected) {
-            collected += FrameSample(
-                intendedVsyncNs = frameMetrics.getMetric(FrameMetrics.INTENDED_VSYNC_TIMESTAMP),
-                totalNs = frameMetrics.getMetric(FrameMetrics.TOTAL_DURATION),
-                deadlineNs = frameMetrics.getMetric(FrameMetrics.DEADLINE),
-                firstDraw = frameMetrics.getMetric(FrameMetrics.FIRST_DRAW_FRAME) != 0L,
+            collected += normalizeFrameSample(
+                FrameSample(
+                    intendedVsyncNs = frameMetrics.getMetric(FrameMetrics.INTENDED_VSYNC_TIMESTAMP),
+                    totalNs = frameMetrics.getMetric(FrameMetrics.TOTAL_DURATION),
+                    deadlineNs = frameMetrics.getMetric(FrameMetrics.DEADLINE),
+                    firstDraw = frameMetrics.getMetric(FrameMetrics.FIRST_DRAW_FRAME) != 0L,
+                    raw = RAW_METRICS.map { frameMetrics.getMetric(it) },
+                ),
             )
         }
     }
@@ -72,5 +75,18 @@ class FrameRecorder(private val window: Window) {
             collected.clear()
             out
         }
+    }
+
+    private companion object {
+        /** Same order as [RAW_METRIC_NAMES]. */
+        val RAW_METRICS = listOf(
+            FrameMetrics.INTENDED_VSYNC_TIMESTAMP, FrameMetrics.VSYNC_TIMESTAMP,
+            FrameMetrics.TOTAL_DURATION, FrameMetrics.DEADLINE,
+            FrameMetrics.INPUT_HANDLING_DURATION, FrameMetrics.ANIMATION_DURATION,
+            FrameMetrics.LAYOUT_MEASURE_DURATION, FrameMetrics.DRAW_DURATION,
+            FrameMetrics.SYNC_DURATION, FrameMetrics.COMMAND_ISSUE_DURATION,
+            FrameMetrics.SWAP_BUFFERS_DURATION, FrameMetrics.GPU_DURATION,
+            FrameMetrics.UNKNOWN_DELAY_DURATION, FrameMetrics.FIRST_DRAW_FRAME,
+        )
     }
 }
