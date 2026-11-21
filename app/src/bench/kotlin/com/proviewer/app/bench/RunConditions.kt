@@ -59,14 +59,15 @@ private fun isEmulator(): Boolean =
 /**
  * Thermal gate for starting and continuing a benchmark run (Task 10). A run may only start below
  * [PowerManager.THERMAL_STATUS_MODERATE]; [tripped] flips to true as soon as the device reaches it
- * so an in-flight run can abort.
+ * so an in-flight run can abort. Implements the runner's [ThermalGate] seam so tests can inject a
+ * fake instead of the device's real thermal state.
  */
-class ThermalGuard(context: Context) {
+class ThermalGuard(context: Context) : ThermalGate {
     private val powerManager = context.getSystemService(Context.POWER_SERVICE) as PowerManager
     private val _tripped = MutableStateFlow(false)
 
     /** Emits true once the thermal status reaches `THERMAL_STATUS_MODERATE` or worse. */
-    val tripped: StateFlow<Boolean> = _tripped.asStateFlow()
+    override val tripped: StateFlow<Boolean> = _tripped.asStateFlow()
 
     private val statusListener = PowerManager.OnThermalStatusChangedListener { status ->
         _tripped.value = status >= PowerManager.THERMAL_STATUS_MODERATE
@@ -77,6 +78,6 @@ class ThermalGuard(context: Context) {
     }
 
     /** True when the device is cool enough to start a benchmark run. */
-    fun canStart(): Boolean =
+    override fun canStart(): Boolean =
         powerManager.currentThermalStatus < PowerManager.THERMAL_STATUS_MODERATE
 }

@@ -1,15 +1,15 @@
 package com.proviewer.app.bench
 
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import com.proviewer.app.bench.BenchmarkScreen as RealBenchmarkScreen
 
 /** Bench-enabled variant features (compiled into the `debug` and `benchmark` build types). */
 object VariantFeatures {
     val benchmarkAvailable: Boolean = true
 
-    // Placeholder until Task 10 wires the real benchmark runner and results screen.
+    /** The real benchmark screen (Task 10): runner, scenarios, results and JSON share. */
     @Composable
     fun BenchmarkScreen(onBack: () -> Unit) {
-        Text("Benchmark (placeholder)")
+        RealBenchmarkScreen(onBack = onBack)
     }
 }
