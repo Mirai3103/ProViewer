@@ -2,6 +2,7 @@ package com.proviewer.app.reader
 
 import androidx.compose.ui.unit.IntSize
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -107,5 +108,22 @@ class ReaderLogicTest {
     fun visible_region_is_null_when_content_is_off_screen() {
         // Content panned entirely to the right of the viewport: no intersection.
         assertNull(visibleRegion(1600, 2400, 1080, 1620, 2f, 2000f, 0f, 1080, 2378))
+    }
+    @Test
+    fun fitSize_is_uncapped_fit() {
+        assertEquals(IntSize(1080, 32400), fitSize(800, 24000, 1080, 2378, FitMode.Width))
+        assertEquals(IntSize(1080, 1620), fitSize(1600, 2400, 1080, 2378, FitMode.Screen))
+    }
+
+    @Test
+    fun visibleRegion_capped_base_needs_detail_at_fit() {
+        // Laid out at the 1080 x 32400 fit size, but the base bitmap was capped: the fit view is
+        // upscaled, so a detail of the visible part (the whole viewport) is still needed.
+        assertNull(visibleRegion(800, 24000, 1080, 32400, 1f, 0f, 0f, 1080, 2378))
+        val region = visibleRegion(800, 24000, 1080, 32400, 1f, 0f, 0f, 1080, 2378, baseCapped = true)
+        assertNotNull(region)
+        assertEquals(1080, region!!.outW)
+        assertEquals(2378, region.outH)
+        assertEquals(800, region.w)
     }
 }

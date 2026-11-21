@@ -1,5 +1,6 @@
 package com.proviewer.app.reader
 
+import android.net.Uri
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -9,9 +10,12 @@ import androidx.lifecycle.viewModelScope
 import com.proviewer.app.engine.NativeBook
 import com.proviewer.app.engine.PageRenderer
 import com.proviewer.app.engine.UploadStrategy
+import com.proviewer.app.open.BookOpener
 import com.proviewer.app.open.OpenResult
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 
 /** The reader's UI state. [page], [direction] and [fitMode] live here so they survive rotation. */
@@ -26,6 +30,10 @@ data class ReaderState(
 
 /**
  * Owns the opened [NativeBook], its [PageRenderer] and its [PageWindow], and survives rotation.
+ * It also runs the open itself ([open]) on [viewModelScope], so a copy or open in flight survives
+ * rotation instead of being cancelled with the Activity.
+ *
+ * Every public method must be called on the main thread.
  *
  * The window's render coroutines run on [viewModelScope] (the main dispatcher) so slot
  * publications are serialized on main, and `window.update` runs on the same dispatcher so image
@@ -54,6 +62,69 @@ class ReaderViewModel : ViewModel() {
     /** The last non-positive-guarded viewport, or null before the first [onViewport]. */
     internal val viewport: IntSize? get() = if (viewW > 0 && viewH > 0) IntSize(viewW, viewH) else null
 
+    /** Why the last [open] failed, or null. Cleared when a new open starts. */
+    var openError: String? by mutableStateOf(null)
+        private set
+
+    /** Copy progress (0..1) of the open in flight, or null when idle or the size is unknown. */
+    var copyProgress: Float? by mutableStateOf(null)
+        private set
+
+    /**
+     * True once an [open] has attached a book that the host has not yet shown; the host switches
+     * to the reader and calls [consumeOpened]. State (not a callback) so a book that finishes
+     * opening during a rotation is still picked up by the recreated Activity.
+     */
+    var openedPending: Boolean by mutableStateOf(false)
+        private set
+
+    private var openJob: Job? = null
+
+    /**
+     * Opens [uri] through [opener] (which must hold the application context, never an Activity)
+     * and attaches it on success. A newer [open] or [cancelOpen] cancels the one in flight; the
+     * opener closes a book whose open completed just as it was cancelled.
+     */
+    fun open(opener: BookOpener, uri: Uri) {
+        openJob?.cancel()
+        openError = null
+        copyProgress = null
+        openJob = viewModelScope.launch {
+            val result = try {
+                opener.open(uri) { copied, total ->
+                    copyProgress = if (total != null && total > 0) copied.toFloat() / total else null
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                OpenResult.Failed(e::class.simpleName ?: "open failed")
+            } finally {
+                copyProgress = null
+            }
+            // No suspension between the open returning and attach: the book cannot be dropped.
+            when (result) {
+                is OpenResult.Opened -> {
+                    attach(result)
+                    openedPending = true
+                }
+                is OpenResult.Failed -> openError = result.reason
+            }
+        }
+    }
+
+    /** Cancels the open in flight, if any (a partial copy is deleted by the opener). */
+    fun cancelOpen() {
+        openJob?.cancel()
+        openJob = null
+    }
+
+    /** Acknowledges [openedPending]; returns whether there was an unshown opened book. */
+    fun consumeOpened(): Boolean {
+        val pending = openedPending
+        openedPending = false
+        return pending
+    }
+
     fun attach(opened: OpenResult.Opened, strategy: UploadStrategy = UploadStrategy.Hardware) {
         releaseResources()
         val book = opened.book
@@ -81,10 +152,15 @@ class ReaderViewModel : ViewModel() {
         scheduleWindowUpdate()
     }
 
-    /** Called when the pager settles on a page; delegates to [goTo] (a no-op when unchanged). */
-    fun onPageSettled(page: Int) {
+    /**
+     * Called when the pager settles on a page. Only a settle after a user swipe ([fromUser])
+     * moves the reader ([goTo], a no-op when unchanged); a programmatic animation's settle only
+     * updates [settledPage], so an interrupted animation can never pull the reader back to the
+     * page it was interrupted at.
+     */
+    fun onPageSettled(page: Int, fromUser: Boolean = true) {
         settledPage = page
-        goTo(page)
+        if (fromUser) goTo(page)
     }
 
     /** The page the pager last settled on; a test seam to await an animation's end. */

@@ -63,7 +63,11 @@ fun BenchmarkScreen(
     val activity = checkNotNull(LocalContext.current.findComponentActivity()) {
         "BenchmarkScreen must be hosted by a ComponentActivity"
     }
-    val owned = remember { runner ?: BenchmarkRunner(activity, scale, guard ?: ThermalGuard(activity)) }
+    // A guard this screen creates is closed when the screen leaves composition, so its system
+    // thermal listener never outlives the screen.
+    val ownedGuard = remember { if (runner == null && guard == null) ThermalGuard(activity) else null }
+    DisposableEffect(ownedGuard) { onDispose { ownedGuard?.close() } }
+    val owned = remember { runner ?: BenchmarkRunner(activity, scale, guard ?: checkNotNull(ownedGuard)) }
     val scope = rememberCoroutineScope()
     val running by owned.running.collectAsState()
     val result by owned.result.collectAsState()

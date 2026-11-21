@@ -5,6 +5,7 @@ import android.graphics.ColorSpace
 import android.hardware.HardwareBuffer
 import androidx.compose.ui.unit.IntSize
 import com.proviewer.app.reader.PageRegion
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
@@ -62,8 +63,20 @@ class HardwarePageImage(
  * is the production implementation.
  */
 interface PageSourceRenderer {
+    /** Number of pages in the book. */
+    val pageCount: Int
+
     suspend fun renderBase(page: Int, size: IntSize): PageImage
-    fun pageSize(page: Int): IntSize?
+
+    /** The natural size of [page] if it was already probed, else null. Never blocks; main-safe. */
+    fun knownPageSize(page: Int): IntSize?
+
+    /**
+     * Probes the natural size of [page] off the caller's thread (the probe may read and inflate
+     * the whole archive entry). Throws for an out-of-range page or a probe failure.
+     */
+    suspend fun probePageSize(page: Int): IntSize
+
     fun prefetchHint(current: Int, forward: Boolean, viewW: Int, viewH: Int)
 }
 
@@ -97,33 +110,52 @@ class PageRenderer(
     /**
      * Renders [region] of [page] to a target of exactly `region.outW x region.outH`. Runs off the
      * caller's dispatcher; the caller (PageWindow) is responsible for releasing the returned image.
+     *
+     * `withContext` has a prompt cancellation guarantee: if the caller is cancelled after the
+     * render finished but before the result is handed back, `withContext` throws and drops the
+     * value. The finished image is therefore tracked in [produced] and released on that path, so
+     * no bitmap or hardware buffer is ever orphaned.
      */
-    suspend fun render(page: Int, region: PageRegion): PageImage = withContext(dispatcher) {
-        val token = NativePixels.newCancelToken()
+    suspend fun render(page: Int, region: PageRegion): PageImage {
+        var produced: PageImage? = null
         try {
-            when (strategy) {
-                UploadStrategy.Software -> renderSoftware(page, region, token)
-                UploadStrategy.Hardware -> renderHardware(page, region, token) ?: run {
-                    fellBack = true
-                    renderSoftware(page, region, token)
+            return withContext(dispatcher) {
+                val token = NativePixels.newCancelToken()
+                val image = try {
+                    when (strategy) {
+                        UploadStrategy.Software -> renderSoftware(page, region, token)
+                        UploadStrategy.Hardware -> renderHardware(page, region, token) ?: run {
+                            fellBack = true
+                            renderSoftware(page, region, token)
+                        }
+                    }
+                } finally {
+                    NativePixels.releaseCancelToken(token)
                 }
+                produced = image
+                image
             }
-        } finally {
-            NativePixels.releaseCancelToken(token)
+        } catch (e: CancellationException) {
+            produced?.release()
+            throw e
         }
     }
 
+    override val pageCount: Int get() = book.pageCount
+
     override suspend fun renderBase(page: Int, size: IntSize): PageImage {
-        val info = book.pageInfo(page)
-        return render(page, PageRegion(0, 0, info.width.toInt(), info.height.toInt(), size.width, size.height))
+        val natural = probePageSize(page)
+        return render(page, PageRegion(0, 0, natural.width, natural.height, size.width, size.height))
     }
 
-    override fun pageSize(page: Int): IntSize? = try {
-        val info = book.pageInfo(page)
-        IntSize(info.width.toInt(), info.height.toInt())
-    } catch (e: Exception) {
-        null // probe failed (e.g. out of range)
-    }
+    override fun knownPageSize(page: Int): IntSize? =
+        book.cachedPageInfo(page)?.let { IntSize(it.width.toInt(), it.height.toInt()) }
+
+    override suspend fun probePageSize(page: Int): IntSize = knownPageSize(page)
+        ?: withContext(Dispatchers.IO) {
+            val info = book.pageInfo(page)
+            IntSize(info.width.toInt(), info.height.toInt())
+        }
 
     override fun prefetchHint(current: Int, forward: Boolean, viewW: Int, viewH: Int) {
         book.book.prefetchHint(

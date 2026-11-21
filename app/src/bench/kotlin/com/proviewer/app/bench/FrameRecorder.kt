@@ -10,8 +10,10 @@ import android.view.Window
  * Collects per-frame timing samples from a [Window] for the benchmark (Task 9). Start before the
  * frames of interest and stop to get the collected samples. The recorder is reusable across
  * start/stop cycles (the runner holds one recorder and cycles it per scenario): each [start]
- * creates a fresh private [HandlerThread] and [stop] tears it down, and [stop] returns only the
- * samples collected since its own [start]. The [FrameMetrics.INTENDED_VSYNC_TIMESTAMP] and
+ * creates a fresh private [HandlerThread], listener and sample list (a session) and [stop] tears
+ * them down, and [stop] returns only the samples collected since its own [start]. Callbacks that
+ * were already queued on the old handler when [stop] ran are dropped by their closed session, so
+ * they can never leak into the next scenario. The [FrameMetrics.INTENDED_VSYNC_TIMESTAMP] and
  * [FrameMetrics.DEADLINE] metrics only exist since API 31, so on older devices nothing is
  * registered and [stop] returns an empty list.
  */
@@ -20,16 +22,16 @@ class FrameRecorder(private val window: Window) {
     /** Frame metrics needed by the benchmark exist only since Android 12 (API 31). */
     val supported: Boolean = Build.VERSION.SDK_INT >= 31
 
-    private var thread: HandlerThread? = null
-    private val collected = mutableListOf<FrameSample>()
-    private var handler: Handler? = null
-    private var running = false
+    /** One start/stop cycle: its own listener and samples; closed sessions drop late callbacks. */
+    private class Session {
+        val samples = mutableListOf<FrameSample>()
+        var open = true
 
-    // The FrameMetrics argument is only valid inside the callback, so the values are copied into a
-    // FrameSample immediately. Calls arrive on [handler]; [collected] is guarded for stop().
-    private val listener = Window.OnFrameMetricsAvailableListener { _, frameMetrics, _ ->
-        synchronized(collected) {
-            collected += normalizeFrameSample(
+        // The FrameMetrics argument is only valid inside the callback, so the values are copied
+        // into a FrameSample immediately. Calls arrive on the handler; the session is guarded for
+        // stop().
+        val listener = Window.OnFrameMetricsAvailableListener { _, frameMetrics, _ ->
+            val sample = normalizeFrameSample(
                 FrameSample(
                     intendedVsyncNs = frameMetrics.getMetric(FrameMetrics.INTENDED_VSYNC_TIMESTAMP),
                     totalNs = frameMetrics.getMetric(FrameMetrics.TOTAL_DURATION),
@@ -38,8 +40,14 @@ class FrameRecorder(private val window: Window) {
                     raw = RAW_METRICS.map { frameMetrics.getMetric(it) },
                 ),
             )
+            synchronized(this) {
+                if (open) samples += sample
+            }
         }
     }
+
+    private var thread: HandlerThread? = null
+    private var session: Session? = null
 
     /**
      * Registers the frame metrics listener on a private handler thread; no-op when unsupported
@@ -49,31 +57,29 @@ class FrameRecorder(private val window: Window) {
      * quitting looper would silently drop them all.
      */
     fun start() {
-        if (!supported || running) return
+        if (!supported || session != null) return
         thread?.quitSafely() // no-op unless a previous start() failed midway and left one idle
         val thread = HandlerThread("FrameRecorder").also { it.start() }
         this.thread = thread
-        handler = Handler(thread.looper)
-        window.addOnFrameMetricsAvailableListener(listener, handler!!)
-        running = true
+        val session = Session()
+        window.addOnFrameMetricsAvailableListener(session.listener, Handler(thread.looper))
+        this.session = session
     }
 
     /**
      * Unregisters the listener, tears down the handler thread, and returns the samples collected
-     * since [start] in arrival order, clearing them so the next cycle starts empty.
+     * since [start] in arrival order. The session is closed first, so callbacks still queued on
+     * the quitting handler are dropped; the next cycle starts with a fresh, empty session.
      */
     fun stop(): List<FrameSample> {
-        if (running) {
-            window.removeOnFrameMetricsAvailableListener(listener)
-            handler = null
-            thread?.quitSafely()
-            thread = null
-            running = false
-        }
-        return synchronized(collected) {
-            val out = collected.toList()
-            collected.clear()
-            out
+        val session = this.session ?: return emptyList()
+        this.session = null
+        window.removeOnFrameMetricsAvailableListener(session.listener)
+        thread?.quitSafely()
+        thread = null
+        return synchronized(session) {
+            session.open = false
+            session.samples.toList()
         }
     }
 

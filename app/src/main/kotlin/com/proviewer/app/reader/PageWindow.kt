@@ -15,7 +15,11 @@ import java.util.concurrent.ConcurrentHashMap
 /** The render state of a page in the window. */
 sealed interface PageSlot {
     object Loading : PageSlot
-    data class Ready(val image: PageImage, val size: IntSize) : PageSlot
+    /**
+     * A rendered base: [image] is [size] pixels and is laid out at [display] (its fit size), which
+     * is larger than [size] only when the base was memory-capped.
+     */
+    data class Ready(val image: PageImage, val size: IntSize, val display: IntSize = size) : PageSlot
     data class Failed(val reason: String) : PageSlot
 }
 
@@ -23,6 +27,9 @@ sealed interface PageSlot {
  * Keeps the current page plus [ahead] ahead and [behind] behind rendered at the fit size for the
  * current viewport and mode. Runs all render work on the injected [scope]'s dispatcher (never a
  * hidden global dispatcher), so JVM tests can drive it with a `StandardTestDispatcher`.
+ *
+ * [update] never blocks on a page-size probe: a page whose natural size is not known yet is probed
+ * inside its render job (the renderer probes off the caller's thread).
  */
 class PageWindow(
     private val scope: CoroutineScope,
@@ -32,7 +39,10 @@ class PageWindow(
 ) {
     val pages: SnapshotStateMap<Int, PageSlot> = mutableStateMapOf()
 
-    private data class Running(val job: Job, val size: IntSize)
+    /** What a render is for: the inputs [baseSize] is computed from, besides the page itself. */
+    private data class Spec(val viewW: Int, val viewH: Int, val mode: FitMode)
+
+    private data class Running(val job: Job, val spec: Spec)
 
     private val running = ConcurrentHashMap<Int, Running>()
     @Volatile private var currentPage = -1
@@ -46,10 +56,9 @@ class PageWindow(
     fun update(current: Int, forward: Boolean, viewW: Int, viewH: Int, mode: FitMode) {
         if (closed) return
         currentPage = current
-        // The window is bounded by pageSize(page) == null (out of range), not by a total page
-        // count, so Int.MAX_VALUE just disables windowPages' count-based range check.
-        val target = windowPages(current, Int.MAX_VALUE, ahead, behind, forward)
+        val target = windowPages(current, renderer.pageCount, ahead, behind, forward)
         val targetSet = target.toHashSet()
+        val spec = Spec(viewW, viewH, mode)
 
         // Evict pages that left the window.
         for (p in pages.keys.toList()) {
@@ -65,22 +74,26 @@ class PageWindow(
 
         // Start or keep renders in priority order.
         for (p in target) {
-            val natural = renderer.pageSize(p) ?: continue // out of range
-            val size = baseSize(natural.width, natural.height, viewW, viewH, mode)
             when (val slot = pages[p]) {
-                is PageSlot.Ready -> if (slot.size != size) {
-                    slot.image.release()
-                    startRender(p, size)
+                is PageSlot.Ready -> {
+                    // A Ready page was probed to render it, so its size is known without blocking.
+                    val natural = renderer.knownPageSize(p)
+                    val stale = natural == null || slot.size != baseSize(natural.width, natural.height, viewW, viewH, mode) ||
+                        slot.display != fitSize(natural.width, natural.height, viewW, viewH, mode)
+                    if (stale) {
+                        slot.image.release()
+                        startRender(p, spec)
+                    }
                 }
                 is PageSlot.Loading -> {
                     val r = running[p]
-                    if (r == null || r.size != size) {
+                    if (r == null || r.spec != spec) {
                         r?.job?.cancel()
-                        startRender(p, size)
+                        startRender(p, spec)
                     }
                 }
                 is PageSlot.Failed -> Unit // keep the failure until the page is evicted
-                null -> startRender(p, size)
+                null -> startRender(p, spec)
             }
         }
 
@@ -105,26 +118,30 @@ class PageWindow(
         pages.clear()
     }
 
-    private fun startRender(page: Int, size: IntSize) {
+    private fun startRender(page: Int, spec: Spec) {
         pages[page] = PageSlot.Loading
         val job = scope.launch {
             try {
+                val natural = renderer.knownPageSize(page) ?: renderer.probePageSize(page)
+                val size = baseSize(natural.width, natural.height, spec.viewW, spec.viewH, spec.mode)
+                val display = fitSize(natural.width, natural.height, spec.viewW, spec.viewH, spec.mode)
                 val image = renderer.renderBase(page, size)
                 if (closed) {
                     image.release()
                     return@launch
                 }
                 if (page != currentPage) image.prepareToDraw()
-                pages[page] = PageSlot.Ready(image, size)
+                pages[page] = PageSlot.Ready(image, size, display)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Throwable) {
                 if (!closed) pages[page] = PageSlot.Failed(reasonOf(e))
             }
         }
-        running[page] = Running(job, size)
+        val entry = Running(job, spec)
+        running[page] = entry
         // Remove the entry only if it is still this job (a later re-render may have replaced it).
-        job.invokeOnCompletion { running.remove(page, Running(job, size)) }
+        job.invokeOnCompletion { running.remove(page, entry) }
     }
 
     private fun reasonOf(e: Throwable): String = when (e) {

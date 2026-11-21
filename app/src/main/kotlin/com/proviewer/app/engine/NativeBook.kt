@@ -6,6 +6,7 @@ import uniffi.proviewer_core.Book
 import uniffi.proviewer_core.PageInfo
 import uniffi.proviewer_core.releaseBookHandle
 import java.io.File
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -42,12 +43,19 @@ class NativeBook(
         throw t
     }
 
-    private val infoCache = HashMap<Int, PageInfo>()
+    private val infoCache = ConcurrentHashMap<Int, PageInfo>()
     private val closed = AtomicBoolean(false)
 
-    /** Page size and format, probed once per page and memoized. */
-    @Synchronized
-    fun pageInfo(i: Int): PageInfo = infoCache.getOrPut(i) { book.pageInfo(i.toUInt()) }
+    /**
+     * Page size and format, probed once per page and memoized. The probe may read and inflate the
+     * whole entry, so call it off the main thread unless [cachedPageInfo] already has the page. No
+     * lock is held while probing (two threads probing one page both do the work, harmlessly), so a
+     * slow probe never blocks a [cachedPageInfo] read.
+     */
+    fun pageInfo(i: Int): PageInfo = infoCache[i] ?: book.pageInfo(i.toUInt()).also { infoCache[i] = it }
+
+    /** The memoized [pageInfo] of page [i], or null if it was never probed. Never blocks. */
+    fun cachedPageInfo(i: Int): PageInfo? = infoCache[i]
 
     override fun close() {
         if (!closed.compareAndSet(false, true)) return

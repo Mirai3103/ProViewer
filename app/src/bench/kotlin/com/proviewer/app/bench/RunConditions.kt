@@ -61,9 +61,14 @@ private fun isEmulator(): Boolean =
  * [PowerManager.THERMAL_STATUS_MODERATE]; [tripped] flips to true as soon as the device reaches it
  * so an in-flight run can abort. Implements the runner's [ThermalGate] seam so tests can inject a
  * fake instead of the device's real thermal state.
+ *
+ * The listener is registered with the system service, so the owner must [close] the guard when
+ * done. The guard only holds the application context, so a guard that outlives its screen never
+ * leaks an Activity.
  */
-class ThermalGuard(context: Context) : ThermalGate {
-    private val powerManager = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+class ThermalGuard(context: Context) : ThermalGate, AutoCloseable {
+    private val powerManager =
+        context.applicationContext.getSystemService(Context.POWER_SERVICE) as PowerManager
     private val _tripped = MutableStateFlow(false)
 
     /** Emits true once the thermal status reaches `THERMAL_STATUS_MODERATE` or worse. */
@@ -75,6 +80,11 @@ class ThermalGuard(context: Context) : ThermalGate {
 
     init {
         powerManager.addThermalStatusListener(statusListener)
+    }
+
+    /** Unregisters the thermal listener. Idempotent. */
+    override fun close() {
+        runCatching { powerManager.removeThermalStatusListener(statusListener) }
     }
 
     /** True when the device is cool enough to start a benchmark run. */

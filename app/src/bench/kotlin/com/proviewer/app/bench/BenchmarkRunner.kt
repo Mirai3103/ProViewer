@@ -34,7 +34,8 @@ import java.io.File
 
 /**
  * Thermal gate seam over [ThermalGuard] so callers (tests) can inject the thermal state instead of
- * reading the device's. The real guard registers its process-scoped listener in its constructor.
+ * reading the device's. The real guard registers its listener in its constructor and unregisters
+ * it in [ThermalGuard.close].
  */
 interface ThermalGate {
     /** True when the device is cool enough to start a benchmark run. */
@@ -73,15 +74,15 @@ data class BenchmarkHostState(val generation: Int, val vm: ReaderViewModel?)
  * [onAutomationDelivered]. `run` must be called from a Compose composition scope: the scripted
  * animated page turns need the composition's `MonotonicFrameClock`.
  *
- * The thermal guard is constructed once for the runner's lifetime (its listener is process-scoped
- * and has no unregister); `run` refuses to start when [ThermalGuard.canStart] is false and aborts
+ * The runner does not own [guard]: whoever created it closes it (BenchmarkScreen closes the one it
+ * creates when it leaves composition). `run` refuses to start when [ThermalGuard.canStart] is false and aborts
  * the current scenario at the next checkpoint when the guard trips. Scenario durations are logged
  * so the owner's real-device run can check the 3-minute total target (spec 6.4).
  */
 class BenchmarkRunner(
     private val activity: ComponentActivity,
     private val scale: Float = 1f,
-    private val guard: ThermalGate = ThermalGuard(activity),
+    private val guard: ThermalGate,
 ) {
     private val powerManager = activity.getSystemService(Context.POWER_SERVICE) as PowerManager
     private val engine get() = (activity.application as ProViewerApp).engine

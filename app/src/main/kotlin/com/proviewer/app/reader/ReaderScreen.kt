@@ -8,6 +8,7 @@ import android.view.WindowManager
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.interaction.DragInteraction
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -45,6 +46,7 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import kotlinx.coroutines.flow.distinctUntilChanged
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.roundToInt
 
 /**
@@ -79,10 +81,22 @@ fun ReaderScreen(
 
     val pagerState = rememberPagerState(initialPage = state.page, pageCount = { state.count })
 
+    // True from the start of a user drag on the pager until its scroll settles. Only such a
+    // scroll may move the ViewModel: a programmatic animation that is interrupted by the next one
+    // (two quick volume presses) briefly reports "not scrolling" at an intermediate page, and
+    // reporting that would snap the reader back to it.
+    val userScroll = remember { AtomicBoolean(false) }
+    LaunchedEffect(pagerState) {
+        pagerState.interactionSource.interactions.collect {
+            if (it is DragInteraction.Start) userScroll.set(true)
+        }
+    }
+
     // ViewModel -> pager: animate to the logical page when it changes (tap zones, volume keys,
     // slider, automation). Skipped when the pager is already there (a settle from a user swipe).
     LaunchedEffect(state.page) {
         if (pagerState.currentPage != state.page) {
+            userScroll.set(false) // the VM now owns the target; a leftover fling must not report
             pagerState.animateScrollToPage(state.page)
         }
     }
@@ -93,7 +107,7 @@ fun ReaderScreen(
         snapshotFlow { pagerState.currentPage to pagerState.isScrollInProgress }
             .distinctUntilChanged()
             .collect { (page, inProgress) ->
-                if (!inProgress) vm.onPageSettled(page)
+                if (!inProgress) vm.onPageSettled(page, fromUser = userScroll.getAndSet(false))
             }
     }
 
@@ -187,7 +201,7 @@ private fun PageSlotView(
             is PageSlot.Ready -> {
                 val renderer = vm.renderer
                 val state = vm.state
-                val naturalSize = renderer?.pageSize(page)
+                val naturalSize = renderer?.knownPageSize(page) // known: the page rendered
                 if (renderer != null && state != null && naturalSize != null) {
                     ZoomablePage(
                         page = page,

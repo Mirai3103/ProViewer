@@ -21,7 +21,7 @@ import org.junit.Test
 @OptIn(ExperimentalCoroutinesApi::class)
 class PageWindowTest {
 
-    private class FakeRenderer(val pageCount: Int) : PageSourceRenderer {
+    private class FakeRenderer(override val pageCount: Int) : PageSourceRenderer {
         /** renderBase start order, with the size each render was asked for. */
         val started = mutableListOf<Pair<Int, IntSize>>()
         /** renders that completed (returned an image). */
@@ -54,8 +54,20 @@ class PageWindowTest {
             }
         }
 
-        override fun pageSize(page: Int): IntSize? =
-            if (page in 0 until pageCount) IntSize(100, 150) else null
+        /** Natural page size; tests may override pages. */
+        var natural: (Int) -> IntSize = { IntSize(100, 150) }
+        /** pages probed through probePageSize (i.e. not already known). */
+        val probed = mutableListOf<Int>()
+        private val known = HashSet<Int>()
+
+        override fun knownPageSize(page: Int): IntSize? = if (page in known) natural(page) else null
+
+        override suspend fun probePageSize(page: Int): IntSize {
+            require(page in 0 until pageCount) { "page $page out of range" }
+            probed.add(page)
+            known.add(page)
+            return natural(page)
+        }
 
         override fun prefetchHint(current: Int, forward: Boolean, viewW: Int, viewH: Int) {
             prefetches.add(listOf(current, forward, viewW, viewH))
@@ -189,5 +201,38 @@ class PageWindowTest {
 
         assertTrue("no slot may be published after close", window.pages.isEmpty())
         assertEquals(setOf(4, 5, 6, 7, 8), renderer.cancelled.toSet())
+    }
+    @Test
+    fun window_is_bounded_by_page_count_and_update_never_probes() = runTest {
+        val renderer = FakeRenderer(pageCount = 3)
+        val window = PageWindow(this, renderer, ahead = 3, behind = 1)
+
+        window.update(1, forward = true, viewW = 1080, viewH = 2378, mode = FitMode.Screen)
+        // update itself only queued jobs: no size probe ran on the caller.
+        assertTrue("update must not probe synchronously", renderer.probed.isEmpty())
+        advanceUntilIdle()
+
+        assertEquals(setOf(0, 1, 2), window.pages.keys)
+        assertEquals(setOf(0, 1, 2), renderer.probed.toSet())
+    }
+
+    @Test
+    fun capped_base_keeps_fit_display_size() = runTest {
+        // A webtoon strip: Width fit is 1080 x 32400, far over the base caps.
+        val renderer = FakeRenderer(pageCount = 1).apply { natural = { IntSize(800, 24000) } }
+        val window = PageWindow(this, renderer, ahead = 0, behind = 0)
+
+        window.update(0, forward = true, viewW = 1080, viewH = 2378, mode = FitMode.Width)
+        advanceUntilIdle()
+
+        val slot = window.pages[0] as PageSlot.Ready
+        assertEquals(IntSize(1080, 32400), slot.display)
+        assertEquals(baseSize(800, 24000, 1080, 2378, FitMode.Width), slot.size)
+        assertTrue("base must be capped below the display size", slot.size.width < slot.display.width)
+
+        // Same view again: the Ready slot is up to date and is not re-rendered.
+        window.update(0, forward = true, viewW = 1080, viewH = 2378, mode = FitMode.Width)
+        advanceUntilIdle()
+        assertEquals(1, renderer.started.size)
     }
 }

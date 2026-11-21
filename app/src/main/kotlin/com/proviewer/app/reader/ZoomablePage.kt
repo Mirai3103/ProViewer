@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.wrapContentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -26,6 +27,7 @@ import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.ScaleFactor
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLayoutDirection
@@ -40,6 +42,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -59,6 +62,9 @@ private const val DETAIL_SETTLE_MS = 150L
 /** A rendered detail image and the on-screen rect (in the page slot) it is drawn at. */
 private class ShownDetail(val image: PageImage, val rect: Rect)
 
+/** The part of a content transformation a detail render depends on. */
+private data class TransformKey(val scale: ScaleFactor, val offset: Offset)
+
 /**
  * The one detail image of a page (D5): either a rendered [ShownDetail] is displayed over the base
  * bitmap, or nothing. A new transformation cancels the pending or running detail job, and a
@@ -68,10 +74,14 @@ private class DetailHost {
     var job: Job? = null
     var shown by mutableStateOf<ShownDetail?>(null)
 
+    /** The transformation the pending/running job or the [shown] detail was made for. */
+    var madeFor: TransformKey? = null
+
     /** Cancels any pending or running render and drops the shown detail, reporting it cleared. */
     fun clear(probe: ReaderProbe, page: Int) {
         job?.cancel()
         job = null
+        madeFor = null
         hide(probe, page)
     }
 
@@ -86,7 +96,7 @@ private class DetailHost {
 }
 
 /**
- * The visual bounds of the page's base bitmap within the viewport: the base size, centred
+ * The visual bounds of the page's base within the viewport: its laid-out (fit) size, centred
  * ([FitMode.Screen]) or top-left aligned ([FitMode.Width], [FitMode.Height]). [Modifier.zoomable]
  * uses it for edge detection, and it must match where this composable actually draws the base.
  */
@@ -127,7 +137,10 @@ fun ZoomablePage(
     onZoom: (ZoomAutomation?) -> Unit,
 ) {
     val bitmap = slot.image.bitmap ?: return
-    val base = slot.size
+    // The base is laid out at its fit size; a memory-capped base bitmap (smaller than that) is
+    // upscaled to it, and the detail render then sharpens even the fit view.
+    val base = slot.display
+    val baseCapped = slot.size != slot.display
     val alignment = when (mode) {
         FitMode.Screen -> Alignment.Center
         FitMode.Width, FitMode.Height -> Alignment.TopStart
@@ -141,13 +154,14 @@ fun ZoomablePage(
     val currentBase by rememberUpdatedState(base)
     val currentAlignment by rememberUpdatedState(alignment)
     val currentPageSize by rememberUpdatedState(pageSize)
+    val currentBaseCapped by rememberUpdatedState(baseCapped)
     val currentLayoutDirection by rememberUpdatedState(layoutDirection)
 
     val state = rememberZoomableState(
         zoomSpec = ZoomSpec(maxZoomFactor = max(4f, pageSize.width / base.width.toFloat())),
     ).also {
-        // The base is drawn at its own pixel size, so telephoto's zoom factor - and the
-        // ZoomSpec limit - are screen pixels per base pixel, exactly what visibleRegion expects.
+        // The base is drawn at its fit size, so telephoto's zoom factor - and the ZoomSpec
+        // limit - are screen pixels per fit-size pixel, exactly what visibleRegion expects.
         it.contentScale = ContentScale.None
         it.contentAlignment = alignment
         it.setContentLocation(BaseContentLocation(Size(base.width.toFloat(), base.height.toFloat()), alignment))
@@ -211,6 +225,13 @@ fun ZoomablePage(
     LaunchedEffect(state) {
         val effectScope = this
         snapshotFlow { state.contentTransformation }
+            .onEach { transformation ->
+                // A new transformation invalidates the detail at once: its rect no longer matches
+                // where the base is drawn, so a stale sharp patch must not float over a moving
+                // base until the next settle (and a render for the old one must not land).
+                val key = transformation.takeIf { it.isSpecified }?.let { TransformKey(it.scale, it.offset) }
+                if (key != detail.madeFor) detail.clear(probe, page)
+            }
             .debounce(DETAIL_SETTLE_MS)
             .collect { transformation ->
                 if (!transformation.isSpecified || viewport.width <= 0) return@collect
@@ -227,12 +248,14 @@ fun ZoomablePage(
                     contentTop = contentTop,
                     viewW = viewport.width,
                     viewH = viewport.height,
+                    baseCapped = currentBaseCapped,
                 )
                 if (region == null) {
                     detail.clear(probe, page) // the base already shows everything there is
                     return@collect
                 }
                 detail.job?.cancel()
+                detail.madeFor = TransformKey(transformation.scale, transformation.offset)
                 detail.job = effectScope.launch {
                     val image = try {
                         probe.onDetailRender(page, "start")
@@ -294,8 +317,12 @@ fun ZoomablePage(
             Image(
                 bitmap = bitmap.asImageBitmap(),
                 contentDescription = null,
-                contentScale = ContentScale.Fit,
+                contentScale = ContentScale.FillBounds,
                 modifier = Modifier
+                    // A Width/Height fit can be larger than the viewport: measure unbounded and
+                    // overflow from the alignment corner, so the incoming constraints never
+                    // shrink the page below its fit size (BaseContentLocation assumes that size).
+                    .wrapContentSize(alignment, unbounded = true)
                     .size(with(density) { base.width.toDp() }, with(density) { base.height.toDp() })
                     .drawWithContent {
                         drawContent()

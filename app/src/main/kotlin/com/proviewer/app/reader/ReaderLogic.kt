@@ -39,11 +39,10 @@ const val MAX_BASE_DIM = 4096
 const val MAX_BASE_BYTES = 32L * 1024 * 1024
 
 /**
- * The size of a page's base (fit) render for [mode], then scaled down uniformly until both dims
- * are `<= MAX_BASE_DIM` and `w*h*4 <= MAX_BASE_BYTES`, rounded, at least 1. A capped page gets a
- * lower-resolution base; the detail render supplies sharpness while zoomed.
+ * The on-screen size of a page fitted into the viewport for [mode] (rounded, at least 1), before
+ * any memory cap. This is the size the page is laid out and drawn at; [baseSize] may be smaller.
  */
-fun baseSize(pageW: Int, pageH: Int, viewW: Int, viewH: Int, mode: FitMode): IntSize {
+fun fitSize(pageW: Int, pageH: Int, viewW: Int, viewH: Int, mode: FitMode): IntSize {
     require(pageW > 0 && pageH > 0 && viewW > 0 && viewH > 0) { "dimensions must be positive" }
 
     val fit = when (mode) {
@@ -51,9 +50,22 @@ fun baseSize(pageW: Int, pageH: Int, viewW: Int, viewH: Int, mode: FitMode): Int
         FitMode.Width -> viewW.toDouble() / pageW
         FitMode.Height -> viewH.toDouble() / pageH
     }
+    return IntSize(
+        (pageW * fit).roundToInt().coerceAtLeast(1),
+        (pageH * fit).roundToInt().coerceAtLeast(1),
+    )
+}
 
-    var w = (pageW * fit).roundToInt().coerceAtLeast(1)
-    var h = (pageH * fit).roundToInt().coerceAtLeast(1)
+/**
+ * The size of a page's base (fit) render: [fitSize], then scaled down uniformly until both dims
+ * are `<= MAX_BASE_DIM` and `w*h*4 <= MAX_BASE_BYTES`, rounded, at least 1. A capped page gets a
+ * lower-resolution base that is still drawn (upscaled) at [fitSize]; the detail render supplies
+ * sharpness.
+ */
+fun baseSize(pageW: Int, pageH: Int, viewW: Int, viewH: Int, mode: FitMode): IntSize {
+    val fitted = fitSize(pageW, pageH, viewW, viewH, mode)
+    var w = fitted.width
+    var h = fitted.height
 
     // The same uniform factor applies to both dims.
     var scale = 1.0
@@ -128,11 +140,14 @@ fun windowPages(
 }
 
 /**
- * The page region visible on screen when the base render (baseW x baseH for the full page) is drawn
- * at [zoom] with its top-left at ([contentLeft], [contentTop]) in screen pixels.
+ * The page region visible on screen when the base (laid out at baseW x baseH screen pixels for the
+ * full page at zoom 1) is drawn at [zoom] with its top-left at ([contentLeft], [contentTop]) in
+ * screen pixels.
  *
  * Returns null when the base already provides the on-screen image: at fit scale (`zoom <= 1.001`)
- * and the base matches the viewport in the fitted dimension (`baseW == viewW || baseH == viewH`).
+ * and the base matches the viewport in the fitted dimension (`baseW == viewW || baseH == viewH`),
+ * unless [baseCapped] says the base bitmap has fewer pixels than its laid-out size (then the fit
+ * view is upscaled and still needs a detail render).
  * Otherwise it returns the screen ∩ transformed-content rectangle mapped back to page pixels
  * (floor for the top-left, ceil for the bottom-right, clamped to the page), with `outW`/`outH`
  * equal to the on-screen size of that intersection. Returns null if the intersection is empty.
@@ -147,8 +162,9 @@ fun visibleRegion(
     contentTop: Float,
     viewW: Int,
     viewH: Int,
+    baseCapped: Boolean = false,
 ): PageRegion? {
-    if (zoom * baseW <= baseW * 1.001f && (baseW == viewW || baseH == viewH)) return null
+    if (!baseCapped && zoom * baseW <= baseW * 1.001f && (baseW == viewW || baseH == viewH)) return null
 
     val x0 = max(0f, contentLeft)
     val y0 = max(0f, contentTop)

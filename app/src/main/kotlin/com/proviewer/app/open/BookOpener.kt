@@ -3,12 +3,12 @@ package com.proviewer.app.open
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
-import android.os.ParcelFileDescriptor
 import android.os.StatFs
 import android.provider.OpenableColumns
 import com.proviewer.app.engine.NativeBook
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import uniffi.proviewer_core.Engine
@@ -29,17 +29,37 @@ sealed interface OpenResult {
  * URI falls back to copying the stream into `cacheDir/opened/<uuid>.cbz` and opening it by path.
  *
  * Every failure path returns [OpenResult.Failed] rather than throwing; only coroutine cancellation
- * propagates.
+ * propagates. Safe to call from the main thread: all resolver and engine work runs on
+ * `Dispatchers.IO`.
  */
 class BookOpener(private val context: Context, private val engine: Engine) {
 
+    /**
+     * Opens [uri]. The whole open runs inside one `withContext(Dispatchers.IO)`. That call has a
+     * prompt cancellation guarantee: a cancel that lands after the block produced [OpenResult.Opened]
+     * makes it throw and drop the value, so the opened book is tracked and closed on that path
+     * instead of being orphaned (fd, registry handle and copied file).
+     */
     suspend fun open(uri: Uri, onCopyProgress: (copied: Long, total: Long?) -> Unit): OpenResult {
+        var produced: NativeBook? = null
+        try {
+            return withContext(Dispatchers.IO) {
+                val result = openOnIo(uri, onCopyProgress)
+                if (result is OpenResult.Opened) produced = result.book
+                result
+            }
+        } catch (e: CancellationException) {
+            produced?.close()
+            throw e
+        }
+    }
+
+    /** The open itself, on the IO dispatcher. Must not suspend after producing its result. */
+    private suspend fun openOnIo(uri: Uri, onCopyProgress: (Long, Long?) -> Unit): OpenResult {
         val meta = metaOf(uri)
 
         // A file:// URI names a local path; the engine opens it by path directly.
-        if (uri.scheme == "file") {
-            return withContext(Dispatchers.IO) { openByPath(uri, meta.title) }
-        }
+        if (uri.scheme == "file") return openByPath(uri, meta.title)
 
         val opened = tryOpenFd(uri, meta.title)
         if (opened != null) return opened
@@ -50,45 +70,40 @@ class BookOpener(private val context: Context, private val engine: Engine) {
     /**
      * Attempts the direct fd path. Returns null when the fallback copy path should run instead
      * (`openFileDescriptor` threw or returned null, or the engine reported [EngineException.NotSeekable]).
+     * Has no suspension point, so a cancellation can never land between `detachFd` and `openFd`
+     * and orphan the raw fd.
      */
-    private suspend fun tryOpenFd(uri: Uri, title: String): OpenResult? {
+    private fun tryOpenFd(uri: Uri, title: String): OpenResult? {
         val pfd = try {
             context.contentResolver.openFileDescriptor(uri, "r")
         } catch (e: Exception) {
             null
         } ?: return null
         val fd = pfd.detachFd()
-        return withContext(Dispatchers.IO) {
-            val book = try {
-                engine.openFd(fd) // takes ownership of the fd
-            } catch (e: EngineException.NotSeekable) {
-                return@withContext null // the engine closed the fd; fall back to the copy path
-            } catch (e: EngineException) {
-                // Rust dropped the fd on every EngineException return path.
-                return@withContext OpenResult.Failed(reasonOf(e))
-            } catch (e: CancellationException) {
-                closeFd(fd) // openFd never took ownership; the fd is still ours
-                throw e
-            } catch (e: Throwable) {
-                // Anything but EngineException (e.g. an uniffi InternalException from a Rust panic)
-                // leaves the fd in Kotlin's hands; close it so it is never orphaned.
-                closeFd(fd)
-                return@withContext OpenResult.Failed(reasonOfUnexpected(e))
-            }
+        val book = try {
+            engine.openFd(fd) // takes ownership of the fd
+        } catch (e: EngineException.NotSeekable) {
+            return null // the engine closed the fd; fall back to the copy path
+        } catch (e: EngineException) {
+            // Rust dropped the fd on every EngineException return path.
+            return OpenResult.Failed(reasonOf(e))
+        } catch (e: Throwable) {
+            // Rust open_fd adopts the fd (File::from_raw_fd) before doing anything else, so a
+            // panic (surfaced as an uniffi InternalException) already closed it while unwinding.
+            // Closing it again here could close an unrelated descriptor that reused the number.
+            return OpenResult.Failed(reasonOfUnexpected(e))
+        }
 
-            try {
-                takePersistablePermission(uri)
-                OpenResult.Opened(NativeBook(book, copiedFile = null), title)
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                // NativeBook's constructor already released the book (and its fd) if it threw.
-                OpenResult.Failed(reasonOfFailure(e))
-            }
+        return try {
+            takePersistablePermission(uri)
+            OpenResult.Opened(NativeBook(book, copiedFile = null), title)
+        } catch (e: Exception) {
+            // NativeBook's constructor already released the book (and its fd) if it threw.
+            OpenResult.Failed(reasonOfFailure(e))
         }
     }
 
-    private suspend fun openByPath(uri: Uri, title: String): OpenResult {
+    private fun openByPath(uri: Uri, title: String): OpenResult {
         val path = uri.path ?: return OpenResult.Failed("no path for $uri")
         return try {
             val book = engine.openPath(path)
@@ -96,8 +111,6 @@ class BookOpener(private val context: Context, private val engine: Engine) {
             OpenResult.Opened(NativeBook(book, copiedFile = null), title)
         } catch (e: EngineException) {
             OpenResult.Failed(reasonOf(e))
-        } catch (e: CancellationException) {
-            throw e
         } catch (e: Throwable) {
             OpenResult.Failed(reasonOfUnexpected(e))
         }
@@ -107,7 +120,7 @@ class BookOpener(private val context: Context, private val engine: Engine) {
         uri: Uri,
         meta: UriMeta,
         onCopyProgress: (Long, Long?) -> Unit,
-    ): OpenResult = withContext(Dispatchers.IO) {
+    ): OpenResult {
         val dir = File(context.cacheDir, "opened").apply { mkdirs() }
         val dest = File(dir, "${UUID.randomUUID()}.cbz")
 
@@ -117,14 +130,14 @@ class BookOpener(private val context: Context, private val engine: Engine) {
         try {
             try {
                 input = context.contentResolver.openInputStream(uri)
-                    ?: return@withContext OpenResult.Failed("no readable stream for $uri")
+                    ?: return OpenResult.Failed("no readable stream for $uri")
 
                 // Check free space before creating the output file, so a refusal never leaves
                 // an empty destination behind.
                 if (meta.size != null) {
                     val free = StatFs(dir.absolutePath).availableBytes
                     if (free < meta.size + FREE_SPACE_MARGIN) {
-                        return@withContext OpenResult.Failed("not enough free space to copy $uri")
+                        return OpenResult.Failed("not enough free space to copy $uri")
                     }
                 }
 
@@ -133,7 +146,7 @@ class BookOpener(private val context: Context, private val engine: Engine) {
                 val buffer = ByteArray(COPY_BUFFER_BYTES)
                 var copied = 0L
                 while (true) {
-                    ensureActive()
+                    currentCoroutineContext().ensureActive()
                     val n = input.read(buffer)
                     if (n < 0) break
                     output.write(buffer, 0, n)
@@ -148,26 +161,21 @@ class BookOpener(private val context: Context, private val engine: Engine) {
 
                 val book = engine.openPath(dest.absolutePath)
                 takePersistablePermission(uri)
+                // NativeBook releases the book itself if its constructor throws; the copy is then
+                // deleted by the finally below.
+                val opened = NativeBook(book, dest)
                 succeeded = true
-                OpenResult.Opened(NativeBook(book, dest), meta.title)
+                return OpenResult.Opened(opened, meta.title)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                OpenResult.Failed(reasonOfFailure(e))
+                return OpenResult.Failed(reasonOfFailure(e))
             }
         } finally {
             runCatching { input?.close() }
             runCatching { output?.close() }
             // A partial copy is deleted on cancellation and on any failure before a successful open.
             if (!succeeded) runCatching { dest.delete() }
-        }
-    }
-
-    private fun closeFd(fd: Int) {
-        try {
-            ParcelFileDescriptor.adoptFd(fd).close()
-        } catch (e: Exception) {
-            // Best effort: nothing else can be done with a raw fd that will not close.
         }
     }
 

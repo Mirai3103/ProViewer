@@ -12,6 +12,7 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.proviewer.app.bench.BenchmarkRunner
 import com.proviewer.app.bench.BenchmarkScreen
 import com.proviewer.app.bench.ThermalGate
+import com.proviewer.app.bench.ThermalGuard
 import com.proviewer.app.bench.ThermalRefusalException
 import com.proviewer.app.bench.toJson
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -46,7 +47,15 @@ class BenchmarkRunTest {
 
     @Test
     fun full_run_produces_valid_json() {
-        val runner = BenchmarkRunner(composeRule.activity, scale = 0.25f)
+        val guard = ThermalGuard(composeRule.activity)
+        try {
+            fullRun(BenchmarkRunner(composeRule.activity, scale = 0.25f, guard = guard))
+        } finally {
+            guard.close()
+        }
+    }
+
+    private fun fullRun(runner: BenchmarkRunner) {
         composeRule.setContent { BenchmarkScreen(onBack = {}, runner = runner) }
 
         composeRule.onNodeWithTag("bench-start").performClick()
