@@ -9,6 +9,7 @@ import androidx.compose.ui.test.doubleClick
 import androidx.compose.ui.test.junit4.v2.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performTouchInput
+import androidx.compose.ui.test.swipe
 import androidx.compose.ui.test.swipeLeft
 import androidx.compose.ui.unit.IntSize
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -327,6 +328,41 @@ class ZoomTest {
         composeRule.onNodeWithTag("reader-page-0").performTouchInput { swipeLeft() }
         composeRule.waitUntil(10_000) { readerVm.state?.page == 1 }
         assertEquals(1, readerVm.state!!.page)
+    }
+
+    @Test
+    fun zoomed_pan_to_edge_in_one_drag_does_not_turn() {
+        val probe = RecordingProbe()
+        val readerVm = launchReader(corpusFile("screentone.cbz"), probe)
+        awaitReadyAndSettled(readerVm)
+        val zoom = zoomAutomation()
+        val pageW = readerVm.book!!.pageInfo(0).width.toInt()
+
+        // Zoom to 2x at the centre and let the centred detail settle: the content now overflows
+        // the viewport by about 540 px on each side.
+        mainScope.launch { zoom.zoomTo(2f, viewportCentre(readerVm), animate = false) }
+        composeRule.waitUntil(20_000) { probe.eventCount("done") == 1 }
+
+        // ONE drag of about 920 px, more than the pan room to the right edge: the part past the
+        // edge must be absorbed, never handed to the pager within the same gesture.
+        composeRule.onNodeWithTag("reader-page-0").performTouchInput {
+            swipe(
+                start = Offset(0.9f * width, centerY),
+                end = Offset(0.05f * width, centerY),
+                durationMillis = 400,
+            )
+        }
+        composeRule.waitForIdle()
+
+        // The panned view settled: its detail render touches the page's right edge.
+        composeRule.waitUntil(20_000) {
+            probe.images().any { it != null && it.x + it.w == pageW }
+        }
+        // Give a (wrongly) started pager turn time to settle before asserting it did not happen.
+        Thread.sleep(1_000)
+        composeRule.waitForIdle()
+        assertNoScopeErrors()
+        assertEquals("one drag must pan to the edge, not turn the page", 0, readerVm.state!!.page)
     }
 
     @Test

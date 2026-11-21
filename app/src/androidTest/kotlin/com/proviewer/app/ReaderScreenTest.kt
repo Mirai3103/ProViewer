@@ -3,12 +3,18 @@ package com.proviewer.app
 import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.graphics.Bitmap
+import android.graphics.Color as AndroidColor
 import android.net.Uri
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.test.junit4.createEmptyComposeRule
+import androidx.compose.ui.test.captureToImage
 import androidx.compose.ui.test.click
 import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.test.onRoot
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performSemanticsAction
 import androidx.compose.ui.test.performTouchInput
@@ -18,14 +24,25 @@ import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.proviewer.app.bench.CorpusGenerator
+import com.proviewer.app.engine.NativeBook
+import com.proviewer.app.open.OpenResult
 import com.proviewer.app.reader.FitMode
 import com.proviewer.app.reader.PageSlot
+import com.proviewer.app.reader.ReaderAutomation
+import com.proviewer.app.reader.ReaderScreen
 import com.proviewer.app.reader.ReaderViewModel
+import com.proviewer.app.reader.ZoomAutomation
 import com.proviewer.app.reader.baseSize
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -271,6 +288,48 @@ class ReaderScreenTest {
     }
 
     @Test
+    fun fit_width_tall_page_starts_at_origin_and_pans_to_bottom() {
+        // 1000x3000 -> fit width 1080x3240 (below the base caps, so display == size).
+        withOverflowReader("fit-width-tall.cbz", 1000, 3000, FitMode.Width) { base, zoom ->
+            assertBlocksMatch(
+                "top-left of the screen vs the base's top-left",
+                readBlock(composeRule.onRoot().captureToImage(), 0, 0),
+                baseBlock(base, 0, 0),
+            )
+
+            // Pan far past the bottom: the page's bottom edge must come to rest at the viewport's.
+            panAndSettle(zoom, Offset(0f, -10_000f))
+            val image = composeRule.onRoot().captureToImage()
+            assertBlocksMatch(
+                "bottom-left of the screen vs the base's bottom-left",
+                readBlock(image, 0, image.height - BLOCK),
+                baseBlock(base, 0, base.height - BLOCK),
+            )
+        }
+    }
+
+    @Test
+    fun fit_height_wide_page_starts_at_origin_and_pans_to_right() {
+        // 1600x1200 -> fit height 3171x2378 on the 1080x2378 viewport (not capped).
+        withOverflowReader("fit-height-wide.cbz", 1600, 1200, FitMode.Height) { base, zoom ->
+            assertBlocksMatch(
+                "top-left of the screen vs the base's top-left",
+                readBlock(composeRule.onRoot().captureToImage(), 0, 0),
+                baseBlock(base, 0, 0),
+            )
+
+            // Pan far past the right: the page's right edge must come to rest at the viewport's.
+            panAndSettle(zoom, Offset(-10_000f, 0f))
+            val image = composeRule.onRoot().captureToImage()
+            assertBlocksMatch(
+                "top-right of the screen vs the base's top-right",
+                readBlock(image, image.width - BLOCK, 0),
+                baseBlock(base, base.width - BLOCK, 0),
+            )
+        }
+    }
+
+    @Test
     fun corrupt_page_shows_placeholder_and_next_loads() {
         val cbz = buildCorruptCbz()
         launch(Uri.fromFile(cbz)).use { scenario ->
@@ -377,6 +436,153 @@ class ReaderScreenTest {
             assertTrue(vm.state == null)
             assertTrue(vm.window == null)
         }
+    }
+
+    // --- fit overflow helpers ----------------------------------------------------
+
+    /**
+     * Opens a one-page CBZ whose single JPEG is [w] x [h] in a plain [ComponentActivity] hosting
+     * [ReaderScreen] (so the test can capture the [ReaderAutomation]), switches to [mode], waits
+     * until the base for the settled viewport is Ready, then runs [block] with the base bitmap
+     * (a software copy) and the page's [ZoomAutomation].
+     */
+    private fun withOverflowReader(
+        fileName: String,
+        w: Int,
+        h: Int,
+        mode: FitMode,
+        block: (base: Bitmap, zoom: ZoomAutomation) -> Unit,
+    ) {
+        val file = buildPatternCbz(fileName, w, h)
+        val app = context.applicationContext as ProViewerApp
+        val readerVm = ReaderViewModel()
+        val automation = CompletableDeferred<ReaderAutomation>()
+        val scenario = ActivityScenario.launch(ComponentActivity::class.java)
+        try {
+            scenario.onActivity { activity ->
+                activity.setContent {
+                    ReaderScreen(vm = readerVm, onBack = {}, onAutomation = { automation.complete(it) })
+                }
+            }
+            val book = NativeBook(app.engine.openPath(file.absolutePath), copiedFile = null)
+            composeRule.runOnIdle { readerVm.attach(OpenResult.Opened(book, file.name)) }
+            composeRule.waitUntil(60_000) { readerVm.state != null && readerVm.viewport != null }
+            composeRule.runOnIdle { readerVm.setFitMode(mode) }
+
+            // Wait for the base of the settled viewport (the immersive-bars transition resizes the
+            // window shortly after composition): a stable viewport and a Ready slot of its size.
+            var lastViewport: IntSize? = null
+            var ready: PageSlot.Ready? = null
+            val deadline = System.currentTimeMillis() + 60_000
+            while (System.currentTimeMillis() < deadline && ready == null) {
+                composeRule.waitForIdle()
+                val view = readerVm.viewport!!
+                val slot = readerVm.window?.pages?.get(0) as? PageSlot.Ready
+                if (view == lastViewport && readerVm.state?.fitMode == mode && slot != null &&
+                    slot.size == baseSize(w, h, view.width, view.height, mode)
+                ) {
+                    ready = slot
+                }
+                lastViewport = view
+                if (ready == null) Thread.sleep(200)
+            }
+            val slot = checkNotNull(ready) {
+                "page never became Ready for $mode; viewport=$lastViewport slot=${readerVm.window?.pages?.get(0)}"
+            }
+            assertEquals("the fit must not be memory-capped for this test", slot.size, slot.display)
+            composeRule.waitForIdle()
+
+            val base = checkNotNull(slot.image.bitmap).copy(Bitmap.Config.ARGB_8888, false)
+            val readerAutomation = runBlocking { withTimeout(30_000) { automation.await() } }
+            var zoom: ZoomAutomation? = null
+            composeRule.waitUntil(30_000) {
+                zoom = readerAutomation.zoom
+                zoom != null
+            }
+            block(base, checkNotNull(zoom))
+        } finally {
+            scenario.close()
+            readerVm.release()
+        }
+    }
+
+    /** Pans by [delta] without animation and waits until the composition has drawn the result. */
+    private fun panAndSettle(zoom: ZoomAutomation, delta: Offset) {
+        // Dispatched from a main-thread scope and awaited by polling, so a pan that never
+        // completes fails the test with a message instead of blocking the instrumentation thread.
+        val failure = arrayOfNulls<Throwable>(1)
+        val job = CoroutineScope(Dispatchers.Main).launch {
+            try {
+                zoom.panBy(delta, animate = false)
+            } catch (e: Throwable) {
+                failure[0] = e
+            }
+        }
+        composeRule.waitUntil(15_000) { job.isCompleted }
+        failure[0]?.let { throw AssertionError("panBy failed", it) }
+        composeRule.waitForIdle()
+        Thread.sleep(300) // let the frame (and any detail render) settle
+        composeRule.waitForIdle()
+    }
+
+    private fun readBlock(image: ImageBitmap, x: Int, y: Int): IntArray {
+        val out = IntArray(BLOCK * BLOCK)
+        image.readPixels(out, startX = x, startY = y, width = BLOCK, height = BLOCK)
+        return out
+    }
+
+    private fun baseBlock(base: Bitmap, x: Int, y: Int): IntArray {
+        val out = IntArray(BLOCK * BLOCK)
+        base.getPixels(out, 0, BLOCK, x, y, BLOCK, BLOCK)
+        return out
+    }
+
+    /** Per-channel comparison of two packed ARGB blocks (screen vs base), tolerance [TOLERANCE]. */
+    private fun assertBlocksMatch(what: String, screen: IntArray, base: IntArray) {
+        for (i in screen.indices) {
+            val a = screen[i]
+            val b = base[i]
+            val diff = maxOf(
+                kotlin.math.abs(AndroidColor.red(a) - AndroidColor.red(b)),
+                kotlin.math.abs(AndroidColor.green(a) - AndroidColor.green(b)),
+                kotlin.math.abs(AndroidColor.blue(a) - AndroidColor.blue(b)),
+            )
+            if (diff > TOLERANCE) {
+                fail(
+                    "$what: pixel ${i % BLOCK},${i / BLOCK} differs by $diff " +
+                        "(screen=${Integer.toHexString(a)} base=${Integer.toHexString(b)})",
+                )
+            }
+        }
+    }
+
+    /**
+     * A one-page CBZ of a [w] x [h] JPEG made of 4 px cells with pseudo-random colours, so any
+     * placement offset of the drawn page shows up as a pixel mismatch in a small block.
+     */
+    private fun buildPatternCbz(name: String, w: Int, h: Int): File {
+        val dir = File(context.cacheDir, "reader-screen-corpus").apply { mkdirs() }
+        val file = File(dir, name)
+        val pixels = IntArray(w * h)
+        for (y in 0 until h) {
+            for (x in 0 until w) {
+                val cell = (x / 4) * 73856093 xor (y / 4) * 19349663
+                val v = (cell xor (cell ushr 13)) * 0x2545F491
+                pixels[y * w + x] = AndroidColor.rgb((v ushr 16) and 0xFF, (v ushr 8) and 0xFF, v and 0xFF)
+            }
+        }
+        val bitmap = Bitmap.createBitmap(pixels, w, h, Bitmap.Config.ARGB_8888)
+        val jpeg = ByteArrayOutputStream().also { bitmap.compress(Bitmap.CompressFormat.JPEG, 90, it) }.toByteArray()
+        bitmap.recycle()
+        ZipOutputStream(file.outputStream()).use { zip ->
+            zip.putNextEntry(ZipEntry("001.jpg")); zip.write(jpeg); zip.closeEntry()
+        }
+        return file
+    }
+
+    private companion object {
+        const val BLOCK = 8
+        const val TOLERANCE = 2
     }
 
     // --- corrupt CBZ builder ---------------------------------------------------
