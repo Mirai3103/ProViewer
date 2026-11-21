@@ -200,7 +200,11 @@ class PageRenderer(
      */
     private suspend fun cancellableRender(token: Long, block: () -> Unit) {
         suspendCancellableCoroutine { cont ->
-            cont.invokeOnCancellation { NativePixels.cancel(token) }
+            cont.invokeOnCancellation {
+                // May run after the finally released the token (cancel-vs-resume race); the
+                // resulting InvalidHandle is harmless, so swallow it (must not escape this handler).
+                runCatching { NativePixels.cancel(token) }
+            }
             try {
                 block()
                 cont.resumeWith(Result.success(Unit))

@@ -10,8 +10,9 @@ the exit-verification evidence only (spec §6.5). Phase 1 record: `docs/perf/pha
 
 All commands run 2026-11-21 on the host or the emulator `emulator-5554` (AVD `ProViewer_API37`) on branch `phase-2` at
 commit `df9ad62`. One timing note for the record: an uncommitted bench-source fix batch (not made by this task) landed in
-the working tree mid-verification; gates 1 and 3–7 verified `df9ad62` code (the batch touches only the `bench` source set,
-which `release` does not compile), while gate 2's forced rerun compiled the newer bench sources. Both states pass: the
+the working tree mid-verification; the release side verified `df9ad62` code (the batch touches only the `bench` source set,
+which `release` does not compile), while the benchmark APK was built after the edits landed and may include them — without
+affecting the checked properties — and gate 2's forced rerun compiled the newer bench sources. Both states pass: the
 first unit-test invocation was UP-TO-DATE against the `df9ad62`-era build and the rerun executed clean. Nothing ran on the
 owner's phone, and serial `3B65BT02H6G00000` was never targeted.
 

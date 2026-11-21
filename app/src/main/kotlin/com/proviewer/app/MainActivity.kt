@@ -54,7 +54,11 @@ class MainActivity : ComponentActivity() {
                 openBook(viewUri)
             }
         } else {
-            screen = Screen.valueOf(savedInstanceState.getString(KEY_SCREEN) ?: Screen.Home.name)
+            val restored = Screen.valueOf(savedInstanceState.getString(KEY_SCREEN) ?: Screen.Home.name)
+            // After process death the reader ViewModel is fresh (state == null), so a restored
+            // Reader would be a black screen with no BackHandler; fall back to Home unless the
+            // state survived (ViewModel retained, e.g. a configuration change).
+            screen = if (restored == Screen.Reader && readerViewModel.state == null) Screen.Home else restored
         }
         setContent {
             MaterialTheme {
