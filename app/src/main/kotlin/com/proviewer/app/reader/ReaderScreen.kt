@@ -45,6 +45,7 @@ import androidx.compose.ui.unit.dp
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import com.proviewer.app.reader.webtoon.WebtoonViewport
 import kotlinx.coroutines.flow.distinctUntilChanged
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.roundToInt
@@ -117,6 +118,8 @@ fun ReaderScreen(
 
     // Each rendered unit publishes its ZoomableUnit automation; the current unit's is exposed.
     val unitZooms = remember { mutableStateMapOf<Int, ZoomAutomation>() }
+    // The Webtoon viewport publishes its automation while it exists (null once it is disposed).
+    val webtoonAutomation = remember { mutableStateOf<WebtoonAutomation?>(null) }
     val automation = remember(vm, pagerState) {
         object : ReaderAutomation {
             override suspend fun turnTo(page: Int, animate: Boolean) {
@@ -130,6 +133,8 @@ fun ReaderScreen(
             }
 
             override val zoom: ZoomAutomation? get() = unitZooms[vm.state?.unit]
+
+            override val webtoon: WebtoonAutomation? get() = webtoonAutomation.value
         }
     }
     LaunchedEffect(automation) { onAutomation(automation) }
@@ -143,22 +148,32 @@ fun ReaderScreen(
             .background(Color.Black)
             .onSizeChanged { vm.onViewport(it.width, it.height) },
     ) {
-        HorizontalPager(
-            state = pagerState,
-            reverseLayout = state.direction == Direction.Rtl,
-            beyondViewportPageCount = 1,
-            modifier = Modifier.fillMaxSize(),
-        ) { unitIndex ->
-            UnitSlotView(
-                unitIndex = unitIndex,
+        if (state.layout == Layout.Webtoon && vm.webtoon != null) {
+            // Webtoon: one self-drawn viewport instead of the pager (whose window is closed).
+            WebtoonViewport(
                 vm = vm,
-                direction = state.direction,
-                fitMode = state.fitMode,
+                session = vm.webtoon!!,
                 probe = probe,
-                onZoom = { zoomAutomation ->
-                    if (zoomAutomation == null) unitZooms.remove(unitIndex) else unitZooms[unitIndex] = zoomAutomation
-                },
+                onAutomation = { webtoonAutomation.value = it },
             )
+        } else {
+            HorizontalPager(
+                state = pagerState,
+                reverseLayout = state.direction == Direction.Rtl,
+                beyondViewportPageCount = 1,
+                modifier = Modifier.fillMaxSize(),
+            ) { unitIndex ->
+                UnitSlotView(
+                    unitIndex = unitIndex,
+                    vm = vm,
+                    direction = state.direction,
+                    fitMode = state.fitMode,
+                    probe = probe,
+                    onZoom = { zoomAutomation ->
+                        if (zoomAutomation == null) unitZooms.remove(unitIndex) else unitZooms[unitIndex] = zoomAutomation
+                    },
+                )
+            }
         }
 
         if (state.overlayVisible) {

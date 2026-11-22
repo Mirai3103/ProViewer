@@ -12,13 +12,19 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.proviewer.app.engine.NativeBook
 import com.proviewer.app.engine.PageRenderer
+import com.proviewer.app.engine.TileSource
 import com.proviewer.app.engine.UploadStrategy
 import com.proviewer.app.open.BookOpener
 import com.proviewer.app.open.OpenResult
+import com.proviewer.app.reader.webtoon.WebtoonCommand
+import com.proviewer.app.reader.webtoon.WebtoonLayout
+import com.proviewer.app.reader.webtoon.WebtoonSession
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.launch
 
 /**
@@ -71,6 +77,30 @@ class ReaderViewModel : ViewModel() {
         private set
     internal var sizes: PageSizes? = null
         private set
+
+    /**
+     * The Webtoon session while the layout is [Layout.Webtoon], else null. Snapshot state: the
+     * reader swaps between the pager and the Webtoon viewport on it. Created when the layout
+     * becomes Webtoon with its initial `scrollY` at the current book page's top (so switching
+     * layouts keeps the book page) and closed — releasing all tiles — when the layout leaves
+     * Webtoon; the pager's [PageWindow] is closed while the session owns the budget, and vice
+     * versa. Null while the viewport is not known yet.
+     */
+    var webtoon: WebtoonSession? by mutableStateOf(null)
+        private set
+
+    /**
+     * The page turns of the Webtoon viewport ([next]/[previous]/[goTo] emit these instead of
+     * moving pager units while the layout is Webtoon); the viewport's collector scrolls.
+     */
+    private val webtoonCommandsInternal = MutableSharedFlow<WebtoonCommand>(extraBufferCapacity = 16)
+    val webtoonCommands: SharedFlow<WebtoonCommand> = webtoonCommandsInternal
+
+    /**
+     * Test/benchmark seam: the [TileSource] the Webtoon session renders tiles through (defaults
+     * to the renderer). Read once at session creation; set it before the session exists.
+     */
+    internal var webtoonTileSource: TileSource? = null
 
     /**
      * The reader's units (one pager page each), rebuilt from the current sizes, layout, split,
@@ -170,8 +200,8 @@ class ReaderViewModel : ViewModel() {
         val book = opened.book
         val renderer = PageRenderer(book, strategy)
         // Bytes freed outside the window (detail images, tiles) must let budget-skipped window
-        // targets retry: every release pokes a window update.
-        val budget = ImageBudget(onReleased = { postWindowUpdate() })
+        // targets and tile renders retry: every release pokes both update paths.
+        val budget = ImageBudget(onReleased = { postWindowUpdate(); postWebtoonPoke() })
         val window = PageWindow(viewModelScope, renderer, budget)
         val sizes = PageSizes(viewModelScope, renderer)
         this.book = book
@@ -231,11 +261,14 @@ class ReaderViewModel : ViewModel() {
 
     /**
      * Jumps to book page [page], snapping to the first unit that contains it (the slider snaps to
-     * the first half of a split page). A no-op when the state already matches.
+     * the first half of a split page). While the layout is Webtoon the jump is delivered to the
+     * viewport as a [WebtoonCommand.ToPage] instead (the page updates when the scroll lands,
+     * through [onWebtoonTopPage]). A no-op when the state already matches.
      */
     fun goTo(page: Int) {
         val s = state ?: return
         val clamped = page.coerceIn(0, (s.count - 1).coerceAtLeast(0))
+        if (emitWebtoonCommand(WebtoonCommand.ToPage(clamped))) return
         val unit = unitIndexOf(units, clamped).coerceAtLeast(0)
         if (clamped == s.page && unit == s.unit) return
         state = s.copy(page = clamped, unit = unit)
@@ -267,11 +300,17 @@ class ReaderViewModel : ViewModel() {
     internal var settledPage: Int? = null
         private set
 
-    /** Turns to the next unit; a no-op on the last one. */
-    fun next() = moveUnit(+1)
+    /** Turns to the next unit; in Webtoon, scrolls one tap page down instead. */
+    fun next() {
+        if (emitWebtoonCommand(WebtoonCommand.Page(+1))) return
+        moveUnit(+1)
+    }
 
-    /** Turns to the previous unit; a no-op on the first one. */
-    fun previous() = moveUnit(-1)
+    /** Turns to the previous unit; in Webtoon, scrolls one tap page up instead. */
+    fun previous() {
+        if (emitWebtoonCommand(WebtoonCommand.Page(-1))) return
+        moveUnit(-1)
+    }
 
     private fun moveUnit(delta: Int) {
         val s = state ?: return
@@ -279,6 +318,33 @@ class ReaderViewModel : ViewModel() {
         val targetUnit = units.getOrNull(target) ?: return
         state = s.copy(unit = target, page = targetUnit.parts.first().page)
         scheduleWindowUpdate()
+    }
+
+    /**
+     * Delivers [command] to the Webtoon viewport; returns false when the layout is not Webtoon
+     * (the pager's page turns apply). Never blocks: the buffer absorbs bursts of volume presses.
+     */
+    private fun emitWebtoonCommand(command: WebtoonCommand): Boolean {
+        val s = state ?: return false
+        if (s.layout != Layout.Webtoon || webtoon == null) return false
+        webtoonCommandsInternal.tryEmit(command)
+        return true
+    }
+
+    /**
+     * Called by the Webtoon viewport whenever the page at the viewport's top edge changed: the
+     * current page for the overlay and mode switches ([spec 5.2]), the size prober's priority
+     * (so estimated heights near the reading position land first) and the engine's prefetch hint
+     * (a fit-width hint — Webtoon tiles render at fit width). Must be called on the main thread.
+     */
+    fun onWebtoonTopPage(page: Int, forward: Boolean) {
+        val s = state ?: return
+        val clamped = page.coerceIn(0, (s.count - 1).coerceAtLeast(0))
+        if (clamped != s.page) state = s.copy(page = clamped)
+        sizes?.prioritize(
+            windowPages(clamped, s.count, WEBTOON_PRIORITIZE_AHEAD, WEBTOON_PRIORITIZE_BEHIND, forward),
+        )
+        renderer?.prefetchHint(clamped, forward, viewW, viewH, FitMode.Width)
     }
 
     /** Sets the layout choice and rebuilds the units, keeping the book page. */
@@ -343,6 +409,7 @@ class ReaderViewModel : ViewModel() {
                 recomputeUnits()
             }
         }
+        syncWebtoon()
         scheduleWindowUpdate()
     }
 
@@ -379,6 +446,7 @@ class ReaderViewModel : ViewModel() {
         val unit = unitIndexOf(built, s.page).coerceAtLeast(0)
         if (built != units) units = built
         if (unit != s.unit) state = s.copy(unit = unit)
+        syncWebtoon()
         scheduleWindowUpdate()
     }
 
@@ -438,6 +506,56 @@ class ReaderViewModel : ViewModel() {
         }
     }
 
+    /**
+     * Reconciles the Webtoon session with the current state: creates it (with the session's
+     * initial `scrollY` at the current book page's top and the pager's window closed) when the
+     * layout is Webtoon and the viewport is known, closes it — releasing every tile — when the
+     * layout leaves Webtoon (recreating the pager's window), and does nothing otherwise. Called
+     * from [recomputeUnits] and [onViewport]; idempotent and cheap to repeat.
+     */
+    private fun syncWebtoon() {
+        val s = state
+        if (s == null || renderer == null || budget == null) {
+            closeWebtoon()
+            return
+        }
+        val active = s.layout == Layout.Webtoon && viewport != null
+        if (active) {
+            if (webtoon == null) {
+                val w = viewW
+                val h = viewH
+                val sizeOf = pageSizeLookup()
+                val layout = WebtoonLayout.build(s.count, w, h, sizeOf) { p -> sizes?.failed(p) == true }
+                val session = WebtoonSession(viewModelScope, layout, webtoonTileSource ?: renderer!!, budget!!)
+                // Switching layouts keeps the book page: the column opens at that page's top.
+                session.scrollY = layout.top(s.page)
+                webtoon = session
+                // The pager's window is closed while the session owns the tiles (its bytes return).
+                val win = window
+                window = null
+                win?.close()
+            }
+        } else {
+            if (webtoon != null) closeWebtoon()
+            if (window == null && renderer != null && budget != null) {
+                window = PageWindow(viewModelScope, renderer!!, budget!!)
+                scheduleWindowUpdate()
+            }
+        }
+    }
+
+    /** Closes the Webtoon session, releasing all its tiles. */
+    private fun closeWebtoon() {
+        val session = webtoon
+        webtoon = null
+        session?.close()
+    }
+
+    /** [postWebtoonPoke] from any thread: budget releases happen on render threads. */
+    private fun postWebtoonPoke() {
+        viewModelScope.launch(Dispatchers.Main) { webtoon?.poke() }
+    }
+
     private fun releaseResources() {
         detectJob?.cancel()
         detectJob = null
@@ -446,6 +564,7 @@ class ReaderViewModel : ViewModel() {
         sizesJob = null
         sizes?.close()
         sizes = null
+        closeWebtoon()
         val window = this.window
         this.window = null
         window?.close()
@@ -463,6 +582,10 @@ class ReaderViewModel : ViewModel() {
 /** Units kept rendered ahead of / behind the current one. */
 private const val WINDOW_AHEAD = 3
 private const val WINDOW_BEHIND = 1
+
+/** Pages around the Webtoon viewport's top page whose size probes are prioritized. */
+private const val WEBTOON_PRIORITIZE_AHEAD = 8
+private const val WEBTOON_PRIORITIZE_BEHIND = 4
 
 /** Log tag for the reader's own reconciliation (strip detection timing, later additions). */
 private const val TAG = "ReaderVM"

@@ -105,6 +105,23 @@ fun tapAction(x: Float, width: Float, dir: Direction): TapAction {
     }
 }
 
+/** The fraction of the viewport height one Webtoon tap/volume page-scroll moves (spec 5.2). */
+const val WEBTOON_PAGE_SCROLL = 0.85f
+
+/**
+ * Maps a vertical tap position (Webtoon mode) to an action: top third -> Previous, middle third
+ * -> ToggleOverlay, bottom third -> Next. The Previous/Next turns scroll by [WEBTOON_PAGE_SCROLL]
+ * of the viewport height (spec 5.2's vertical thirds; horizontal thirds elsewhere).
+ */
+fun verticalTapAction(y: Float, height: Float): TapAction {
+    val third = height / 3f
+    return when {
+        y < third -> TapAction.Previous
+        y < 2 * third -> TapAction.ToggleOverlay
+        else -> TapAction.Next
+    }
+}
+
 /**
  * Maps a key code to a page-turn action: volume down -> Next, volume up -> Previous, anything else
  * -> null. Raw Android key codes are used so this file stays free of `android.view` imports.

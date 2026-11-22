@@ -71,10 +71,16 @@ class TileManager(
 
     /**
      * Reconciles the held tiles to [wanted]. Cancels in-flight renders that are no longer wanted
-     * at their exact spec, drops Ready tiles whose wanted spec changed (their pixels would be
-     * wrong), starts the missing renders in priority order, and never probes or blocks.
+     * at their exact spec, drops Ready tiles whose key is wanted at a different spec (their bytes
+     * would be wrong), starts the missing renders in priority order, and never probes or blocks.
+     *
+     * [evictNotWanted] additionally releases every Ready tile the wanted set does not ask for,
+     * so the held bytes return to exactly the working set. During scrolling the default (false)
+     * keeps them as the first eviction candidates; the viewport passes true once the view has
+     * settled (the scroll has been still for the settle delay), which is when idle leftovers
+     * would otherwise be held forever.
      */
-    fun update(wanted: Wanted) {
+    fun update(wanted: Wanted, evictNotWanted: Boolean = false) {
         if (closed) return
         val wantedByKey = wanted.ordered.associateBy { it.key }
         val settledLevel = wanted.ordered.firstOrNull()?.key?.level ?: 1000
@@ -87,10 +93,16 @@ class TileManager(
 
         // Drop Ready tiles whose key is wanted at a different spec (e.g. after a viewport resize):
         // their bytes return before anything new is reserved. Ready tiles that are not wanted at
-        // all stay until space is needed (they are the first eviction candidates).
+        // all stay until space is needed (they are the first eviction candidates) unless
+        // [evictNotWanted] asks for the exact working set.
         for (spec in wanted.ordered) {
             val slot = tiles[spec.key]
             if (slot is TileSlot.Ready && slot.spec != spec) dropSlot(spec.key)
+        }
+        if (evictNotWanted) {
+            for ((key, slot) in tiles) {
+                if (slot is TileSlot.Ready && key !in wantedByKey) dropSlot(key)
+            }
         }
 
         // Start the missing renders in wanted order. A tile of a failed page is skipped for good
