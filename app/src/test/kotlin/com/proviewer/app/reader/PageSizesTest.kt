@@ -161,6 +161,33 @@ class PageSizesTest {
     }
 
     @Test
+    fun prioritized_mid_probe_page_bumps_version_when_it_lands() = runTest {
+        // Page 0 is probed and held mid-flight; pages 1 and 2 land immediately (far below the
+        // 16-probe batch, and without completing the book, so no other rule may bump the version).
+        val renderer = ProbeRenderer(pageCount = 4).apply {
+            holds[0] = CompletableDeferred()
+            holds[3] = CompletableDeferred() // keeps the sweep unfinished: no final flush bump
+        }
+        val sizes = PageSizes(this, renderer)
+        val v0 = sizes.version
+        sizes.start()
+        runCurrent()
+        assertEquals(listOf(0, 1, 2, 3), renderer.probeStarts)
+        assertEquals("pages 1 and 2 landing must not bump", v0, sizes.version)
+
+        // Page 0 is claimed (mid-probe), so it can never be enqueued again -- but its landing must
+        // still count as a prioritized landing and bump the version.
+        sizes.prioritize(listOf(0))
+
+        renderer.holds[0]!!.complete(Unit)
+        advanceUntilIdle()
+
+        assertEquals(IntSize(100, 150), sizes.known(0))
+        assertEquals("the mid-probe prioritized page's landing must bump the version", v0 + 1, sizes.version)
+        sizes.close()
+    }
+
+    @Test
     fun close_stops_probing() = runTest {
         val renderer = ProbeRenderer(pageCount = 100).apply { gate = CompletableDeferred() }
         val sizes = PageSizes(this, renderer)

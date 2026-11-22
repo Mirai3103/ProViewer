@@ -41,6 +41,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Rule
@@ -352,6 +353,30 @@ class ReaderScreenTest {
     }
 
     @Test
+    fun probe_failed_page_shows_placeholder_and_next_loads() {
+        val cbz = buildProbeFailCbz()
+        launch(Uri.fromFile(cbz)).use { scenario ->
+            val vm = grabVm(scenario)
+            awaitAttached(vm)
+            waitReady(vm, 0)
+
+            // The size sweep fails on the header-broken page (1): no window target can be built
+            // for it, so the reader must fall back to the error placeholder, not a blank box.
+            composeRule.waitUntil(30_000) { vm.sizes?.failed(1) == true }
+            assertNull("a probe-failed page can never get a window slot", vm.window?.wholeSlot(1))
+
+            // Navigate to it: the placeholder must be shown.
+            goTo(vm, 1)
+            composeRule.waitUntil(10_000) { vm.state?.page == 1 }
+            composeRule.onNodeWithTag("reader-error-1").assertExists()
+
+            // The next page (2) still loads.
+            goTo(vm, 2)
+            waitReady(vm, 2)
+        }
+    }
+
+    @Test
     fun rotation_keeps_page_and_rerenders() {
         launch(mixedSmallUri()).use { scenario ->
             var vm = grabVm(scenario)
@@ -596,6 +621,20 @@ class ReaderScreenTest {
         ZipOutputStream(file.outputStream()).use { zip ->
             zip.putNextEntry(ZipEntry("001.jpg")); zip.write(valid); zip.closeEntry()
             zip.putNextEntry(ZipEntry("002.jpg")); zip.write(corrupt); zip.closeEntry()
+            zip.putNextEntry(ZipEntry("003.jpg")); zip.write(valid); zip.closeEntry()
+        }
+        return file
+    }
+
+    /** A CBZ with a valid `001.jpg`, a header-broken `002.jpg` (its size probe fails), and a valid `003.jpg`. */
+    private fun buildProbeFailCbz(): File {
+        val dir = File(context.cacheDir, "reader-screen-corpus").apply { mkdirs() }
+        val file = File(dir, "probe-fail.cbz")
+        val valid = validJpegBytes()
+        val headerBroken = ByteArray(64) // not an image: the size probe itself fails
+        ZipOutputStream(file.outputStream()).use { zip ->
+            zip.putNextEntry(ZipEntry("001.jpg")); zip.write(valid); zip.closeEntry()
+            zip.putNextEntry(ZipEntry("002.jpg")); zip.write(headerBroken); zip.closeEntry()
             zip.putNextEntry(ZipEntry("003.jpg")); zip.write(valid); zip.closeEntry()
         }
         return file

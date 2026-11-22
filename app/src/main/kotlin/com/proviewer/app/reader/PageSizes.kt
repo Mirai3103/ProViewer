@@ -73,9 +73,11 @@ class PageSizes(
             priority.clear()
             prioritized.clear()
             for (p in pages) {
-                if (p in 0 until renderer.pageCount && p !in claimed) {
-                    priority.addLast(p)
+                if (p in 0 until renderer.pageCount && !sizes.containsKey(p) && !failures.contains(p)) {
                     prioritized.add(p)
+                    // Already claimed (mid-probe): it cannot be enqueued again, but it must stay
+                    // prioritized so its landing still bumps the version.
+                    if (p !in claimed) priority.addLast(p)
                 }
             }
         }

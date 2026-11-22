@@ -395,6 +395,72 @@ class PageWindowTest {
     }
 
     @Test
+    fun budget_break_releases_lower_priority_stale_ready_images() = runTest {
+        val renderer = FakeRenderer(pageCount = 5)
+        // Exactly one 100x100 base fits.
+        val budget = ImageBudget(capBytes = rgbaBytes(100, 100))
+        val window = PageWindow(this, renderer, budget)
+        fun target(page: Int, side: Int) = PartTarget(
+            part = whole(page),
+            src = IntRect(0, 0, 100, 150),
+            base = IntSize(side, side),
+            display = IntSize(side, side),
+        )
+
+        // Both 50x50 targets fit and render.
+        window.update(listOf(target(0, 50), target(1, 50)), PrefetchRequest(0, true, 100, 100, FitMode.Screen))
+        advanceUntilIdle()
+        assertEquals(wholes(0, 1), window.slots.keys)
+        assertEquals(2 * rgbaBytes(50, 50), budget.usedBytes)
+
+        // Both targets change spec: page 0 re-renders at 100x100 (exactly the cap) and page 1 at
+        // 60x60 (which no longer fits once page 0 is reserved). Page 1's reservation fails and the
+        // update breaks there -- but page 1's stale image must already have been released by then,
+        // never held spec-mismatched past the break.
+        window.update(listOf(target(0, 100), target(1, 60)), PrefetchRequest(0, true, 100, 100, FitMode.Screen))
+        advanceUntilIdle()
+
+        assertEquals("page 1 must not keep its stale Ready slot", wholes(0), window.slots.keys)
+        assertEquals("both old images released, only page 0's new base held", rgbaBytes(100, 100), budget.usedBytes)
+        assertEquals(setOf(0, 1), renderer.released.toSet())
+    }
+
+    @Test
+    fun budget_break_cancels_lower_priority_stale_loading_jobs() = runTest {
+        val renderer = FakeRenderer(pageCount = 5).apply { hold = CompletableDeferred() }
+        // Two 50x50 bases fit; a 100x100 one does not.
+        val budget = ImageBudget(capBytes = 2 * rgbaBytes(50, 50))
+        val window = PageWindow(this, renderer, budget)
+        fun target(page: Int, side: Int) = PartTarget(
+            part = whole(page),
+            src = IntRect(0, 0, 100, 150),
+            base = IntSize(side, side),
+            display = IntSize(side, side),
+        )
+
+        // Both renders start and suspend on the gate: two Loading slots, both reservations held.
+        window.update(listOf(target(0, 50), target(1, 50)), PrefetchRequest(0, true, 100, 100, FitMode.Screen))
+        runCurrent()
+        assertEquals(listOf(0, 1), renderer.started.map { it.first })
+        assertEquals(2 * rgbaBytes(50, 50), budget.usedBytes)
+
+        // Both targets change spec; page 0's new 100x100 base does not fit, so the update breaks
+        // at it. Page 1's stale in-flight render must still have been cancelled (never left
+        // running spec-mismatched), and its reservation returned.
+        window.update(listOf(target(0, 100), target(1, 60)), PrefetchRequest(0, true, 100, 100, FitMode.Screen))
+        advanceUntilIdle()
+
+        assertTrue("page 1's stale Loading slot must be gone", window.slots.isEmpty())
+        assertEquals(setOf(0, 1), renderer.cancelled.toSet())
+        assertEquals("every reservation returned", 0, budget.usedBytes)
+
+        // Nothing publishes even once the gate opens.
+        renderer.hold!!.complete(Unit)
+        advanceUntilIdle()
+        assertTrue(window.slots.isEmpty())
+    }
+
+    @Test
     fun released_images_return_bytes() = runTest {
         val renderer = FakeRenderer(pageCount = 20)
         val budget = ImageBudget()

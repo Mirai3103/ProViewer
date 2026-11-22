@@ -169,7 +169,10 @@ private fun PageSlotView(
     probe: ReaderProbe,
     onZoom: (ZoomAutomation?) -> Unit,
 ) {
+    // A page whose size probe failed never gets a window target, so it would otherwise render as
+    // a blank box: fall back to the error placeholder the window's Failed slots get.
     val slot = vm.window?.wholeSlot(page)
+        ?: if (vm.sizes?.failed(page) == true) PageSlot.Failed("size probe failed") else null
     val slotSize = remember { mutableStateOf(IntSize.Zero) }
     // Telephoto 0.19.0 captures zoomable's onClick once (its tap node only swaps the handler when
     // the parameter's nullability flips), so the handler must resolve the live values itself

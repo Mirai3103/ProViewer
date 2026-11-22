@@ -102,7 +102,9 @@ class PageWindow(
             if (part !in targetParts) cancel(part)
         }
 
-        // Start or keep renders in priority order, until the budget runs out.
+        // First pass: reconcile every slot, so no stale (spec-mismatched) Ready image or Loading
+        // render survives a budget break below: their bytes are returned before the new
+        // reservations are attempted.
         for (target in targets) {
             val part = target.part
             val spec = Spec(target.src, target.base, target.display)
@@ -119,10 +121,17 @@ class PageWindow(
                     cancel(part)
                     slots.remove(part)
                 }
-                is PageSlot.Failed -> continue // keep the failure until the part is evicted
+                is PageSlot.Failed -> Unit // keep the failure until the part is evicted
                 null -> Unit
             }
-            if (!startRender(part, spec)) break
+        }
+
+        // Second pass: start the missing renders in priority order, until the budget runs out. On
+        // a failed reservation the rest of this update is skipped; it retries on the next update.
+        for (target in targets) {
+            if (slots[target.part] != null) continue // Ready (current spec), Loading or Failed
+            val spec = Spec(target.src, target.base, target.display)
+            if (!startRender(target.part, spec)) break
         }
 
         renderer.prefetchHint(prefetch.page, prefetch.forward, prefetch.viewW, prefetch.viewH, prefetch.mode)
