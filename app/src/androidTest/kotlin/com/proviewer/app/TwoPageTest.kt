@@ -711,6 +711,73 @@ class TwoPageTest {
         assertEquals("the book page is kept across both rotations", 3, readerVm.state!!.page)
     }
 
+    /**
+     * Stress for the recycled-bitmap draw guard: bitmaps are recycled on main (window eviction,
+     * a re-spec, closing the window for Webtoon) while a composition may still hold them, and
+     * Compose applies the snapshot change only on the next recomposition. Auto rotation re-specs
+     * every visible base each time; the layout cycle closes and recreates the window. Any draw of
+     * a recycled bitmap throws "Canvas: trying to use a recycled bitmap" and kills the process.
+     */
+    @Test
+    fun rotations_and_layout_cycles_never_draw_recycled_bitmaps() {
+        val (scenario, readerVm) = launchInActivity(corpusFile("two-page.cbz"), RecordingProbe())
+        awaitViewportSettled(readerVm)
+        composeRule.waitUntil(30_000) { readerVm.isStrip != null && readerVm.state?.detecting == false }
+        assertEquals("portrait Auto opens Single", Layout.Single, readerVm.state!!.layout)
+        composeRule.runOnIdle { readerVm.goTo(3) }
+        composeRule.waitUntil(10_000) { readerVm.state?.page == 3 }
+
+        /** Waits until a base is on screen: the shown unit has a Ready slot (the draw under test). */
+        fun awaitBaseShown() {
+            composeRule.waitUntil(30_000) {
+                val unit = readerVm.units.getOrNull(readerVm.state?.unit ?: -1)
+                unit != null && unit.parts.any { readerVm.window?.slots?.get(it) is PageSlot.Ready }
+            }
+            composeRule.waitForIdle()
+        }
+        awaitBaseShown()
+
+        // Portrait <-> landscape five times with bases visible: Auto flips Single <-> TwoPage and
+        // re-specs every base on each rotation.
+        repeat(5) {
+            rotate(scenario, readerVm, RecordingProbe(), ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE)
+            composeRule.waitUntil(60_000) { readerVm.viewport?.let { it.width > it.height } == true }
+            awaitViewportSettled(readerVm)
+            assertEquals(Layout.TwoPage, readerVm.state!!.layout)
+            awaitBaseShown()
+            rotate(scenario, readerVm, RecordingProbe(), ActivityInfo.SCREEN_ORIENTATION_PORTRAIT)
+            composeRule.waitUntil(60_000) { readerVm.viewport?.let { it.height > it.width } == true }
+            awaitViewportSettled(readerVm)
+            assertEquals(Layout.Single, readerVm.state!!.layout)
+            awaitBaseShown()
+        }
+        assertEquals("the book page is kept across the rotations", 3, readerVm.state!!.page)
+
+        // The overlay's layout button cycles the choices; run the cycle three times through the
+        // same entry point (setLayoutChoice) so Webtoon closes the window and the next choice
+        // recreates it, with bases composed around each switch.
+        repeat(3) {
+            for ((choice, expected) in listOf(
+                LayoutChoice.Single to Layout.Single,
+                LayoutChoice.TwoPage to Layout.TwoPage,
+                LayoutChoice.Webtoon to Layout.Webtoon,
+                LayoutChoice.Auto to Layout.Single, // portrait Auto, no strip
+            )) {
+                composeRule.runOnIdle { readerVm.setLayoutChoice(choice) }
+                composeRule.waitUntil(30_000) { readerVm.state?.layout == expected }
+                if (expected == Layout.Webtoon) {
+                    composeRule.waitUntil(30_000) { readerVm.webtoon != null && readerVm.window == null }
+                } else {
+                    composeRule.waitUntil(30_000) { readerVm.webtoon == null && readerVm.window != null }
+                    awaitBaseShown()
+                }
+                composeRule.waitForIdle()
+                assertEquals("the book page is kept through $choice", 3, readerVm.state!!.page)
+            }
+        }
+        assertNoScopeErrors()
+    }
+
     @Test
     fun manual_layout_wins_over_rotation() {
         val (scenario, readerVm) = launchInActivity(corpusFile("two-page.cbz"), RecordingProbe())

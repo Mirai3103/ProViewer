@@ -3,10 +3,10 @@
 package com.proviewer.app.reader
 
 import androidx.compose.animation.core.SnapSpec
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.size
@@ -26,11 +26,12 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.ScaleFactor
@@ -404,18 +405,25 @@ fun ZoomableUnit(
         for (host in details.parts.values) {
             val shown = host.shown ?: continue
             val bitmap = shown.image.bitmap ?: continue
-            Image(
-                bitmap = bitmap.asImageBitmap(),
-                contentDescription = null,
-                contentScale = ContentScale.None,
-                modifier = Modifier
+            val image = remember(bitmap) { bitmap.asImageBitmap() }
+            // Drawn by hand instead of through Image: Image paints inside its own clip layer,
+            // which Compose re-records on its own (without this node's draw modifiers), and a
+            // re-record after the bitmap was recycled throws. A draw modifier on a node without
+            // a layer of its own runs on every record of the enclosing layer, so the guard holds.
+            Spacer(
+                Modifier
                     .offset {
                         IntOffset(shown.rect.left.roundToInt(), shown.rect.top.roundToInt())
                     }
                     .size(
                         with(density) { shown.rect.width.toDp() },
                         with(density) { shown.rect.height.toDp() },
-                    ),
+                    )
+                    .drawBehind {
+                        // Released on main while this composition still holds it (until the next
+                        // recomposition drops it): draw nothing instead of throwing.
+                        if (!bitmap.isRecycled) drawImage(image)
+                    },
             )
         }
     }
@@ -493,22 +501,32 @@ private fun PartBaseImage(
     density: Density,
 ) {
     val fired = remember(bitmap) { AtomicBoolean(false) }
-    Image(
-        bitmap = bitmap.asImageBitmap(),
-        contentDescription = null,
-        contentScale = ContentScale.FillBounds,
-        modifier = Modifier
+    val image = remember(bitmap) { bitmap.asImageBitmap() }
+    // Drawn by hand instead of through Image, whose own clip layer Compose re-records without this
+    // node's draw modifiers: a re-record after the bitmap was recycled (on main: window eviction,
+    // a re-spec, the window closing for Webtoon — while this composition still holds the bitmap
+    // until its next recomposition) throws "trying to use a recycled bitmap". A draw modifier on a
+    // node without a layer of its own runs on every record of the enclosing layer, and every
+    // release runs on main, so this check cannot race one; the stale frame shows nothing.
+    Spacer(
+        Modifier
             .offset { IntOffset(placement.dst.left, placement.dst.top) }
             .size(
                 with(density) { placement.dst.width.toDp() },
                 with(density) { placement.dst.height.toDp() },
             )
-            .drawWithContent {
-                drawContent()
-                // isSpecified first: while telephoto still hides the unmeasured content, the draw
-                // must not consume the once-only flag. The probe fires only while this unit is
-                // the current one (E5), so a page drawn at rest as a neighbour still fires when
-                // the reader later turns to it.
+            .drawBehind {
+                if (bitmap.isRecycled) return@drawBehind
+                // Fill the bounds (the painter's ContentScale.FillBounds), default Low filtering.
+                drawImage(
+                    image,
+                    dstSize = IntSize(size.width.roundToInt(), size.height.roundToInt()),
+                    filterQuality = FilterQuality.Low,
+                )
+                // The sharp-draw probe fires only after a real draw. isSpecified first: while
+                // telephoto still hides the unmeasured content, the draw must not consume the
+                // once-only flag. It fires only while this unit is the current one (E5), so a page
+                // drawn at rest as a neighbour still fires when the reader later turns to it.
                 if (isCurrent && state.contentTransformation.isSpecified && fired.compareAndSet(false, true)) {
                     probe.onSharpPageDrawn(placement.part.page, System.nanoTime())
                 }

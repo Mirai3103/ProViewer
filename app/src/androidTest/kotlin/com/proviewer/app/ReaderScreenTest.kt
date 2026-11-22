@@ -451,10 +451,11 @@ class ReaderScreenTest {
             awaitAttached(vm)
             waitReady(vm, 0)
 
-            // Pin the layout this test assumes (Single; Auto would resolve it too in portrait,
-            // but the pin keeps that explicit and keeps the whole-page scenario stable across the
-            // rotation — Auto would flip this book to TwoPage in landscape, whose units churn is
-            // the new auto-rotation tests' subject, not this one).
+            // Pinned to Single (this test's Phase 2 whole-page semantics). The recycled-bitmap
+            // crash this pin used to hide is fixed and covered under Auto by TwoPageTest
+            // rotations_and_layout_cycles_never_draw_recycled_bitmaps; the pin stays because this
+            // test, run under Auto, hangs in roughly one run in four (a never-idle main looper,
+            // see docs/perf/phase3-reader.md, known follow-up) while 0 of 8 pinned runs did.
             composeRule.runOnIdle { vm.setLayoutChoice(LayoutChoice.Single) }
 
             goTo(vm, 3)
