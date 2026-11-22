@@ -14,6 +14,7 @@ import androidx.compose.ui.test.junit4.createEmptyComposeRule
 import androidx.compose.ui.test.captureToImage
 import androidx.compose.ui.test.click
 import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.onRoot
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performSemanticsAction
@@ -27,6 +28,7 @@ import com.proviewer.app.bench.CorpusGenerator
 import com.proviewer.app.engine.NativeBook
 import com.proviewer.app.open.OpenResult
 import com.proviewer.app.reader.FitMode
+import com.proviewer.app.reader.Layout
 import com.proviewer.app.reader.LayoutChoice
 import com.proviewer.app.reader.PageSlot
 import com.proviewer.app.reader.Part
@@ -262,6 +264,68 @@ class ReaderScreenTest {
     }
 
     @Test
+    fun overlay_controls_cycle() {
+        launch(mixedSmallUri()).use { scenario ->
+            val vm = grabVm(scenario)
+            awaitAttached(vm)
+            waitReady(vm, 0)
+
+            tapPage(0, 0.5f, 0.5f)
+            composeRule.waitUntil(10_000) { vm.state?.overlayVisible == true }
+
+            // In Single (mixed-small resolves to it: portrait, no strip, no wide pages) the
+            // split control is visible and shift is not.
+            composeRule.onNodeWithTag("reader-split").assertExists()
+            composeRule.onNodeWithTag("reader-shift").assertDoesNotExist()
+
+            // Layout cycles Auto -> Single -> TwoPage -> Webtoon -> Auto.
+            composeRule.onNodeWithTag("reader-layout").performClick()
+            composeRule.waitUntil(10_000) { vm.state?.layoutChoice == LayoutChoice.Single }
+            assertEquals(Layout.Single, vm.state!!.layout)
+
+            composeRule.onNodeWithTag("reader-layout").performClick()
+            composeRule.waitUntil(10_000) { vm.state?.layoutChoice == LayoutChoice.TwoPage }
+            assertEquals(Layout.TwoPage, vm.state!!.layout)
+            composeRule.waitForIdle()
+            composeRule.onNodeWithTag("reader-split").assertDoesNotExist()
+            composeRule.onNodeWithTag("reader-shift").assertExists()
+
+            composeRule.onNodeWithTag("reader-layout").performClick()
+            composeRule.waitUntil(10_000) { vm.state?.layoutChoice == LayoutChoice.Webtoon }
+            assertEquals(Layout.Webtoon, vm.state!!.layout)
+            composeRule.waitForIdle()
+            // Fit is hidden in Webtoon; shift is TwoPage-only.
+            composeRule.onNodeWithTag("reader-fit").assertDoesNotExist()
+            composeRule.onNodeWithTag("reader-shift").assertDoesNotExist()
+
+            composeRule.onNodeWithTag("reader-layout").performClick()
+            composeRule.waitUntil(10_000) { vm.state?.layoutChoice == LayoutChoice.Auto }
+            assertEquals("portrait Auto resolves Single", Layout.Single, vm.state!!.layout)
+            composeRule.waitForIdle()
+            composeRule.onNodeWithTag("reader-fit").assertExists()
+
+            // Split cycles Auto -> On -> Off (Single only).
+            composeRule.onNodeWithTag("reader-split").performClick()
+            composeRule.waitUntil(10_000) { vm.state?.split == SplitChoice.On }
+            composeRule.onNodeWithTag("reader-split").performClick()
+            composeRule.waitUntil(10_000) { vm.state?.split == SplitChoice.Off }
+            assertEquals(SplitChoice.Off, vm.state!!.split)
+
+            // Back to TwoPage: shift toggles the opening pair; a pair shows "n–m / total".
+            composeRule.onNodeWithTag("reader-layout").performClick() // Auto -> Single
+            composeRule.onNodeWithTag("reader-layout").performClick() // Single -> TwoPage
+            composeRule.waitUntil(10_000) { vm.state?.layout == Layout.TwoPage }
+            goTo(vm, 1) // the first pair
+            composeRule.waitUntil(10_000) { vm.state?.page == 1 && vm.state?.unit == 1 }
+            composeRule.onNodeWithText("2\u20133 / 20").assertExists()
+            composeRule.onNodeWithTag("reader-shift").performClick()
+            composeRule.waitUntil(10_000) {
+                vm.state?.shift == true && vm.units.firstOrNull()?.parts?.map { it.page } == listOf(0, 1)
+            }
+        }
+    }
+
+    @Test
     fun fit_mode_change_rerenders_base() {
         launch(mixedSmallUri()).use { scenario ->
             val vm = grabVm(scenario)
@@ -387,6 +451,12 @@ class ReaderScreenTest {
             awaitAttached(vm)
             waitReady(vm, 0)
 
+            // Pin the layout this test assumes (Single; Auto would resolve it too in portrait,
+            // but the pin keeps that explicit and keeps the whole-page scenario stable across the
+            // rotation — Auto would flip this book to TwoPage in landscape, whose units churn is
+            // the new auto-rotation tests' subject, not this one).
+            composeRule.runOnIdle { vm.setLayoutChoice(LayoutChoice.Single) }
+
             goTo(vm, 3)
             composeRule.waitUntil(10_000) { vm.state?.page == 3 }
             waitReady(vm, 3)
@@ -425,7 +495,7 @@ class ReaderScreenTest {
             val vm = grabVm(scenario)
             awaitAttached(vm)
             // Pin the layout this test assumes: it renders whole strip pages through the pager
-            // (auto-selection in Task 6 would otherwise resolve this book to Webtoon).
+            // (auto-selection resolves this book to Webtoon, whose UI arrives in Task 10).
             composeRule.runOnIdle { vm.setLayoutChoice(LayoutChoice.Single) }
             waitReady(vm, 0)
 
@@ -449,10 +519,14 @@ class ReaderScreenTest {
             val vm = grabVm(scenario)
 
             // Wait only for attach (the render may still be in flight). huge-single's page is
-            // wide: pin Split Off so the whole-page unit is the one being rendered (auto-selection
-            // itself arrives in Task 6).
+            // wide: pin the layout this test assumes (Single; Auto would resolve it too, but the
+            // pin keeps that explicit) and Split Off so the whole-page unit is the one being
+            // rendered.
             composeRule.waitUntil(10_000) { vm.state != null }
-            composeRule.runOnIdle { vm.setSplit(SplitChoice.Off) }
+            composeRule.runOnIdle {
+                vm.setLayoutChoice(LayoutChoice.Single)
+                vm.setSplit(SplitChoice.Off)
+            }
             composeRule.onNodeWithTag("reader-root").assertExists()
 
             val book = vm.book!!
@@ -503,8 +577,9 @@ class ReaderScreenTest {
             composeRule.runOnIdle { readerVm.attach(OpenResult.Opened(book, file.name)) }
             composeRule.waitUntil(60_000) { readerVm.state != null && readerVm.viewport != null }
             composeRule.runOnIdle {
-                // fit-height-wide's page is wide: pin Split Off, because this test reads the
-                // whole-page unit and Auto would split it (auto-selection arrives in Task 6).
+                // fit-height-wide's page is wide: pin the layout this test assumes (Single; Auto
+                // would resolve it too) and Split Off, because this test reads the whole-page unit.
+                readerVm.setLayoutChoice(LayoutChoice.Single)
                 readerVm.setSplit(SplitChoice.Off)
                 readerVm.setFitMode(mode)
             }

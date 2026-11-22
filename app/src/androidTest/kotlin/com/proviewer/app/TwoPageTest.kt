@@ -1,7 +1,10 @@
 package com.proviewer.app
 
+import android.content.pm.ActivityInfo
 import android.graphics.Bitmap
 import android.graphics.Color as AndroidColor
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.CompositionLocalProvider
@@ -14,6 +17,7 @@ import androidx.compose.ui.test.junit4.v2.createComposeRule
 import androidx.compose.ui.test.onRoot
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.LayoutDirection
+import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.proviewer.app.bench.CorpusGenerator
@@ -51,6 +55,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Rule
@@ -60,9 +65,11 @@ import java.io.File
 
 /**
  * The unit pager (Task 5): two-page pairing, spread splitting, per-part zoom details and the
- * current-only sharp-draw probe, end to end. The reader is composed directly so the test can
- * provide [LocalReaderProbe] and capture the [ReaderAutomation]; layouts are set programmatically
- * (Task 6 adds the overlay controls).
+ * current-only sharp-draw probe, end to end, plus the auto mode selection (Task 6): Auto detects
+ * strips, resolves by orientation, re-resolves on rotation, and a manual choice wins. The reader
+ * is composed directly so the test can provide [LocalReaderProbe] and capture the
+ * [ReaderAutomation]; layouts are set programmatically (the overlay controls are covered by
+ * ReaderScreenTest's `overlay_controls_cycle`).
  */
 @RunWith(AndroidJUnit4::class)
 class TwoPageTest {
@@ -79,6 +86,9 @@ class TwoPageTest {
 
     private val automation = CompletableDeferred<ReaderAutomation>()
     private var vm: ReaderViewModel? = null
+
+    /** Activity scenarios of the auto-selection tests; closed in [tearDown]. */
+    private val scenarios = mutableListOf<ActivityScenario<ComponentActivity>>()
 
     /** Records probe events; callbacks may arrive from render threads, so access is synchronized. */
     private class RecordingProbe : ReaderProbe {
@@ -194,6 +204,91 @@ class TwoPageTest {
     private fun unitPages(readerVm: ReaderViewModel): List<List<Int>> =
         readerVm.units.map { unit -> unit.parts.map { it.page } }
 
+    /** The unit's parts including split halves ("[0W][1L][1R]..."). */
+    private fun unitParts(readerVm: ReaderViewModel): List<List<UnitPart>> =
+        readerVm.units.map { it.parts }
+
+    /** Opens [file] with the app engine (no copy; the corpus file already lives in the cache). */
+    private fun openNativeBook(file: File): NativeBook {
+        val app = context.applicationContext as ProViewerApp
+        return NativeBook(app.engine.openPath(file.absolutePath), copiedFile = null)
+    }
+
+    /** Composes [ReaderScreen] for [readerVm] into the scenario's current activity. */
+    private fun showReader(
+        scenario: ActivityScenario<ComponentActivity>,
+        readerVm: ReaderViewModel,
+        probe: RecordingProbe,
+    ) {
+        scenario.onActivity { activity ->
+            activity.setContent {
+                CompositionLocalProvider(LocalReaderProbe provides probe) {
+                    ReaderScreen(
+                        vm = readerVm,
+                        onBack = {},
+                        onAutomation = { automation.complete(it) },
+                    )
+                }
+            }
+        }
+    }
+
+    /**
+     * Launches [ReaderScreen] in its own [ComponentActivity] instead of the compose rule's, so a
+     * rotation can recreate the activity (none of them declares configChanges) while the test
+     * keeps the [ReaderViewModel] and re-applies the content. The book is attached once the
+     * reader is composed.
+     */
+    private fun launchInActivity(file: File, probe: RecordingProbe): Pair<ActivityScenario<ComponentActivity>, ReaderViewModel> {
+        val readerVm = ReaderViewModel()
+        val scenario = ActivityScenario.launch(ComponentActivity::class.java)
+        scenarios += scenario
+        showReader(scenario, readerVm, probe)
+        composeRule.runOnIdle { readerVm.attach(OpenResult.Opened(openNativeBook(file), file.name)) }
+        vm = readerVm
+        return scenario to readerVm
+    }
+
+    /**
+     * Rotates the scenario's activity to [orientation] and re-applies the reader content: the
+     * request recreates the activity (as in production, which declares no configChanges), and a
+     * recreation drops the plain activity's composed content (unlike MainActivity, it re-applies
+     * nothing in onCreate). The rotation is confirmed through the *activity's* configuration —
+     * the VM's viewport is unusable here: it is stale (last recorded size) once the reader is
+     * attached, and null before attach (the empty state has no onSizeChanged).
+     */
+    private fun rotate(
+        scenario: ActivityScenario<ComponentActivity>,
+        readerVm: ReaderViewModel,
+        probe: RecordingProbe,
+        orientation: Int,
+    ) {
+        scenario.onActivity { it.requestedOrientation = orientation }
+        val wantLandscape = orientation == ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+        val deadline = System.currentTimeMillis() + 60_000
+        var lastError: Throwable? = null
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                // The activity may be mid-recreation here; onActivity throws for a destroyed one
+                // and the next iteration targets the recreated instance instead.
+                showReader(scenario, readerVm, probe)
+                var matches = false
+                scenario.onActivity { activity ->
+                    matches = (activity.resources.configuration.orientation ==
+                        android.content.res.Configuration.ORIENTATION_LANDSCAPE) == wantLandscape
+                }
+                if (matches) return
+            } catch (e: Throwable) {
+                lastError = e
+            }
+            Thread.sleep(250)
+        }
+        throw AssertionError(
+            "activity never reached orientation $orientation; viewport=${readerVm.viewport}; " +
+                "lastError=$lastError",
+        )
+    }
+
     /**
      * The on-screen rectangle of the part showing [page] of unit [unitIndex]: the pure unit
      * geometry placed with the same alignment the reader draws it with (FitMode.Screen, centred).
@@ -269,6 +364,10 @@ class TwoPageTest {
     @After
     fun tearDown() {
         mainScope.cancel(CancellationException("test done"))
+        // Close the auto-selection tests' activities before the compose rule's, so a test that
+        // died mid-rotation cannot leave the emulator in a rotated orientation.
+        scenarios.forEach { runCatching { it.close() } }
+        scenarios.clear()
         // Drop the reader from composition before releasing the VM: the release recycles the
         // base bitmaps, which must not happen while a frame could still draw them.
         runCatching {
@@ -527,6 +626,138 @@ class TwoPageTest {
         postAutomation { readerAutomation().turnTo(1, animate = false) }
         composeRule.waitUntil(20_000) { probe.sharpPages().contains(1) && probe.sharpPages().contains(2) }
         assertNoScopeErrors()
+    }
+
+    // --- auto mode selection (Task 6) -------------------------------------------
+
+    /** The two-page pairing of `two-page.cbz`: cover alone, pairs, spread alone, restart. */
+    private val twoPagePairing = listOf(listOf(0), listOf(1, 2), listOf(3), listOf(4), listOf(5, 6), listOf(7))
+
+    @Test
+    fun auto_portrait_opens_single_and_splits_wide() {
+        val readerVm = launchReader(corpusFile("double-spread.cbz"), RecordingProbe())
+        awaitViewportSettled(readerVm)
+
+        // Detection finishes (all 4 pages are probed); the book is no strip (portrait and spread
+        // pages), so portrait Auto resolves Single.
+        composeRule.waitUntil(30_000) { readerVm.isStrip != null && readerVm.state?.detecting == false }
+        assertEquals(false, readerVm.isStrip)
+        assertEquals(Layout.Single, readerVm.state!!.layout)
+        assertFalse(readerVm.state!!.detecting)
+
+        // Split Auto: the two wide pages (1, 3) become half units, portrait pages stay whole.
+        val expected = listOf(
+            listOf(UnitPart(0, Part.Whole)),
+            listOf(UnitPart(1, Part.LeftHalf)),
+            listOf(UnitPart(1, Part.RightHalf)),
+            listOf(UnitPart(2, Part.Whole)),
+            listOf(UnitPart(3, Part.LeftHalf)),
+            listOf(UnitPart(3, Part.RightHalf)),
+        )
+        composeRule.waitUntil(30_000) { unitParts(readerVm) == expected }
+        assertEquals(expected, unitParts(readerVm))
+    }
+
+    @Test
+    fun auto_landscape_opens_two_page() {
+        val probe = RecordingProbe()
+        val readerVm = ReaderViewModel()
+        val scenario = ActivityScenario.launch(ComponentActivity::class.java)
+        scenarios += scenario
+        showReader(scenario, readerVm, probe)
+        // Landscape BEFORE the open: the book is attached only once the activity is landscape.
+        rotate(scenario, readerVm, probe, ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE)
+        composeRule.runOnIdle {
+            readerVm.attach(OpenResult.Opened(openNativeBook(corpusFile("two-page.cbz")), "two-page.cbz"))
+        }
+        awaitViewportSettled(readerVm)
+        assertTrue(
+            "the reader must have laid out in landscape: ${readerVm.viewport}",
+            readerVm.viewport!!.width > readerVm.viewport!!.height,
+        )
+
+        composeRule.waitUntil(30_000) { readerVm.isStrip != null && readerVm.state?.detecting == false }
+        assertEquals("two-page.cbz is no strip", false, readerVm.isStrip)
+        assertEquals("landscape Auto opens TwoPage", Layout.TwoPage, readerVm.state!!.layout)
+        composeRule.waitUntil(30_000) { unitPages(readerVm) == twoPagePairing }
+        assertEquals(twoPagePairing, unitPages(readerVm))
+    }
+
+    @Test
+    fun auto_rotation_switches_and_keeps_page() {
+        val (scenario, readerVm) = launchInActivity(corpusFile("two-page.cbz"), RecordingProbe())
+        awaitViewportSettled(readerVm)
+        composeRule.waitUntil(30_000) { readerVm.isStrip != null && readerVm.state?.detecting == false }
+        assertEquals("portrait Auto opens Single", Layout.Single, readerVm.state!!.layout)
+
+        composeRule.runOnIdle { readerVm.goTo(3) }
+        composeRule.waitUntil(10_000) { readerVm.state?.page == 3 }
+
+        // Rotate to landscape: Auto re-runs the orientation rule and resolves TwoPage, still on
+        // book page 3 (its unit).
+        rotate(scenario, readerVm, RecordingProbe(), ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE)
+        composeRule.waitUntil(60_000) { readerVm.viewport?.let { it.width > it.height } == true }
+        awaitViewportSettled(readerVm)
+        assertEquals(Layout.TwoPage, readerVm.state!!.layout)
+        assertEquals("the book page is kept across the rotation", 3, readerVm.state!!.page)
+        val unit = readerVm.units.getOrNull(readerVm.state!!.unit)
+        assertTrue("the shown unit must contain page 3: ${unit?.parts}", unit?.parts?.any { it.page == 3 } == true)
+
+        // Rotate back to portrait: Auto resolves Single again, still on page 3.
+        rotate(scenario, readerVm, RecordingProbe(), ActivityInfo.SCREEN_ORIENTATION_PORTRAIT)
+        composeRule.waitUntil(60_000) { readerVm.viewport?.let { it.height > it.width } == true }
+        awaitViewportSettled(readerVm)
+        assertEquals(Layout.Single, readerVm.state!!.layout)
+        assertEquals("the book page is kept across both rotations", 3, readerVm.state!!.page)
+    }
+
+    @Test
+    fun manual_layout_wins_over_rotation() {
+        val (scenario, readerVm) = launchInActivity(corpusFile("two-page.cbz"), RecordingProbe())
+        awaitViewportSettled(readerVm)
+        composeRule.waitUntil(30_000) { readerVm.isStrip != null && readerVm.state?.detecting == false }
+
+        // A manual Single wins over the orientation: in landscape Auto would resolve TwoPage.
+        composeRule.runOnIdle { readerVm.setLayoutChoice(LayoutChoice.Single) }
+        rotate(scenario, readerVm, RecordingProbe(), ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE)
+        composeRule.waitUntil(60_000) { readerVm.viewport?.let { it.width > it.height } == true }
+        awaitViewportSettled(readerVm)
+        composeRule.waitForIdle()
+        assertEquals(LayoutChoice.Single, readerVm.state!!.layoutChoice)
+        assertEquals("the manual choice wins over the rotation", Layout.Single, readerVm.state!!.layout)
+        // The units stay Single's: whole pages, with the spread page split under Split Auto.
+        val expected = listOf(
+            listOf(UnitPart(0, Part.Whole)),
+            listOf(UnitPart(1, Part.Whole)),
+            listOf(UnitPart(2, Part.Whole)),
+            listOf(UnitPart(3, Part.Whole)),
+            listOf(UnitPart(4, Part.LeftHalf)),
+            listOf(UnitPart(4, Part.RightHalf)),
+            listOf(UnitPart(5, Part.Whole)),
+            listOf(UnitPart(6, Part.Whole)),
+            listOf(UnitPart(7, Part.Whole)),
+        )
+        composeRule.waitUntil(30_000) { unitParts(readerVm) == expected }
+        assertEquals(expected, unitParts(readerVm))
+    }
+
+    @Test
+    fun auto_strip_opens_webtoon_layout() {
+        val readerVm = launchReader(stripCorpusFile(), RecordingProbe())
+        awaitViewportSettled(readerVm)
+
+        // Every page is a 1:30 strip, so Auto resolves Webtoon. The Webtoon UI itself arrives in
+        // Task 10; until then the pager shows the strip's whole-page units, so this asserts state.
+        composeRule.waitUntil(30_000) { readerVm.isStrip != null && readerVm.state?.detecting == false }
+        assertEquals(true, readerVm.isStrip)
+        assertEquals(Layout.Webtoon, readerVm.state!!.layout)
+        assertFalse(readerVm.state!!.detecting)
+    }
+
+    /** `webtoon-long.cbz` at the briefed scale 0.1, in its own dir (the stamp is per scale). */
+    private fun stripCorpusFile(): File {
+        val dir = File(context.cacheDir, "two-page-strip-corpus").apply { mkdirs() }
+        return runBlocking { CorpusGenerator.ensure(dir, 0.1f, listOf("webtoon-long.cbz")) }.single()
     }
 
     private companion object {

@@ -26,6 +26,7 @@ import com.proviewer.app.reader.ReaderAutomation
 import com.proviewer.app.reader.ReaderProbe
 import com.proviewer.app.reader.ReaderScreen
 import com.proviewer.app.reader.ReaderViewModel
+import com.proviewer.app.reader.LayoutChoice
 import com.proviewer.app.reader.SplitChoice
 import com.proviewer.app.reader.UnitPart
 import com.proviewer.app.reader.ZoomAutomation
@@ -373,9 +374,13 @@ class ZoomTest {
     fun max_zoom_reaches_source_pixels() {
         val probe = RecordingProbe()
         val readerVm = launchReader(corpusFile("huge-single.cbz"), probe)
-        // huge-single's one page is wide (12000x8000): pin Split Off, because this test reads the
-        // whole-page unit and Auto would split it (auto-selection itself arrives in Task 6).
-        composeRule.runOnIdle { readerVm.setSplit(SplitChoice.Off) }
+        // huge-single's one page is wide (12000x8000): pin the layout this test assumes (Single;
+        // Auto would resolve it too, but the pin keeps that explicit) and Split Off, because
+        // this test reads the whole-page unit.
+        composeRule.runOnIdle {
+            readerVm.setLayoutChoice(LayoutChoice.Single)
+            readerVm.setSplit(SplitChoice.Off)
+        }
         awaitReadyAndSettled(readerVm)
         val zoom = zoomAutomation()
 

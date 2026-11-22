@@ -52,8 +52,9 @@ import kotlin.math.roundToInt
 /**
  * The paged reader over [ReaderUnit]s (spec 6.5): an LTR/RTL [HorizontalPager] whose pages are
  * the book's units (a whole page, a split half or a two-page spread), full-screen tap zones, an
- * overlay with the title, back button, page slider and direction/fit toggles, and immersive
- * system bars. Slider and label keep working on book pages.
+ * overlay with the title, back button, page slider, the layout/split/shift controls (spec 5.1's
+ * manual override) and the direction/fit toggles, and immersive system bars. Slider and label
+ * keep working on book pages ("n / total", "n–m / total" for a Two-page pair).
  */
 @Composable
 fun ReaderScreen(
@@ -306,7 +307,7 @@ private fun ReaderOverlay(state: ReaderState, vm: ReaderViewModel, onBack: () ->
         // and toggles the overlay back off.
         Spacer(Modifier.weight(1f))
 
-        // Bottom controls (slider + n/total + direction and fit toggles).
+        // Bottom controls (slider + page label + layout/split/shift, then direction/fit toggles).
         Column(Modifier.fillMaxWidth().background(Color(0xCC000000)).padding(16.dp)) {
             var sliderValue by remember(state.page) { mutableFloatStateOf(state.page.toFloat()) }
             Slider(
@@ -316,7 +317,31 @@ private fun ReaderOverlay(state: ReaderState, vm: ReaderViewModel, onBack: () ->
                 valueRange = 0f..(state.count - 1).coerceAtLeast(1).toFloat(),
                 modifier = Modifier.testTag("reader-slider"),
             )
-            Text("${state.page + 1} / ${state.count}", color = Color.White)
+            Text(pageLabel(state, vm.units), color = Color.White)
+            Row {
+                TextButton(
+                    onClick = { vm.setLayoutChoice(nextLayoutChoice(state.layoutChoice)) },
+                    modifier = Modifier.testTag("reader-layout"),
+                ) {
+                    Text(state.layoutChoice.name, color = Color.White)
+                }
+                if (state.layout == Layout.Single) {
+                    TextButton(
+                        onClick = { vm.setSplit(nextSplitChoice(state.split)) },
+                        modifier = Modifier.testTag("reader-split"),
+                    ) {
+                        Text(state.split.name, color = Color.White)
+                    }
+                }
+                if (state.layout == Layout.TwoPage) {
+                    TextButton(
+                        onClick = { vm.setShift(!state.shift) },
+                        modifier = Modifier.testTag("reader-shift"),
+                    ) {
+                        Text(if (state.shift) "Shift On" else "Shift Off", color = Color.White)
+                    }
+                }
+            }
             Row {
                 TextButton(
                     onClick = {
@@ -326,15 +351,46 @@ private fun ReaderOverlay(state: ReaderState, vm: ReaderViewModel, onBack: () ->
                 ) {
                     Text(if (state.direction == Direction.Ltr) "LTR" else "RTL", color = Color.White)
                 }
-                TextButton(
-                    onClick = { vm.setFitMode(nextFitMode(state.fitMode)) },
-                    modifier = Modifier.testTag("reader-fit"),
-                ) {
-                    Text(state.fitMode.name, color = Color.White)
+                // Fit modes apply to fitted units; the Webtoon viewport has no fit modes (Task 10).
+                if (state.layout != Layout.Webtoon) {
+                    TextButton(
+                        onClick = { vm.setFitMode(nextFitMode(state.fitMode)) },
+                        modifier = Modifier.testTag("reader-fit"),
+                    ) {
+                        Text(state.fitMode.name, color = Color.White)
+                    }
                 }
             }
         }
     }
+}
+
+/**
+ * The page label on book pages: "n / total" for a one-page unit (Single, a split half, a cover or
+ * spread unit in Two-page) and "n–m / total" for a Two-page pair (spec 5.3/5.4).
+ */
+private fun pageLabel(state: ReaderState, units: List<ReaderUnit>): String {
+    val unit = units.getOrNull(state.unit)
+    return if (state.layout == Layout.TwoPage && unit != null && unit.parts.size == 2) {
+        "${unit.parts[0].page + 1}\u2013${unit.parts[1].page + 1} / ${state.count}"
+    } else {
+        "${state.page + 1} / ${state.count}"
+    }
+}
+
+/** The layout choice cycle: Auto -> Single -> TwoPage -> Webtoon -> Auto. */
+private fun nextLayoutChoice(choice: LayoutChoice): LayoutChoice = when (choice) {
+    LayoutChoice.Auto -> LayoutChoice.Single
+    LayoutChoice.Single -> LayoutChoice.TwoPage
+    LayoutChoice.TwoPage -> LayoutChoice.Webtoon
+    LayoutChoice.Webtoon -> LayoutChoice.Auto
+}
+
+/** The split choice cycle: Auto -> On -> Off -> Auto. */
+private fun nextSplitChoice(choice: SplitChoice): SplitChoice = when (choice) {
+    SplitChoice.Auto -> SplitChoice.On
+    SplitChoice.On -> SplitChoice.Off
+    SplitChoice.Off -> SplitChoice.Auto
 }
 
 private fun nextFitMode(mode: FitMode): FitMode = when (mode) {

@@ -1,6 +1,8 @@
 package com.proviewer.app.reader
 
 import android.net.Uri
+import android.os.SystemClock
+import android.util.Log
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -36,6 +38,8 @@ data class ReaderState(
     val shift: Boolean = false,
     val layout: Layout = Layout.Single,
     val unit: Int = 0,
+    /** True while the strip detection is still running (no window update happens before it). */
+    val detecting: Boolean = false,
 )
 
 /**
@@ -76,8 +80,18 @@ class ReaderViewModel : ViewModel() {
     var units: List<ReaderUnit> by mutableStateOf(emptyList())
         private set
 
+    /**
+     * Whether the book detected as a vertical strip (webtoon), or null while the strip detection
+     * is still running. Snapshot state: the overlay's resolved layout depends on it.
+     */
+    var isStrip: Boolean? by mutableStateOf(null)
+        private set
+
     /** Re-runs [recomputeUnits] whenever [PageSizes.version] changes. */
     private var sizesJob: Job? = null
+
+    /** The strip detection of the current [attach]; cancelled by [releaseResources]. */
+    private var detectJob: Job? = null
 
     private var viewW = 0
     private var viewH = 0
@@ -178,9 +192,41 @@ class ReaderViewModel : ViewModel() {
             direction = Direction.Ltr,
             fitMode = FitMode.Screen,
             overlayVisible = false,
+            // While the detection is running the reader shows the Single layout's loading state;
+            // Auto re-resolves (Webtoon for a strip, else by orientation) once it has finished.
             layout = resolvedLayout(LayoutChoice.Auto),
+            detecting = true,
         )
         recomputeUnits()
+        detectJob = viewModelScope.launch { detectStripMode() }
+    }
+
+    /**
+     * The mode detection (spec 5.1): waits until the probes of the first `min(DETECT_SAMPLE_PAGES,
+     * count)` pages have finished (success or failure; off-main header reads through [PageSizes],
+     * already started by [attach]), decides whether the book is a vertical strip ([detectStrip]),
+     * and re-resolves the layout for [LayoutChoice.Auto]. While it runs no window update happens
+     * ([scheduleWindowUpdate] holds), so no page of a possibly wrong layout is rendered; the first
+     * page of the settled layout is rendered right after.
+     */
+    private suspend fun detectStripMode() {
+        val sizes = this.sizes ?: return
+        val n = minOf(DETECT_SAMPLE_PAGES, state?.count ?: 0)
+        val started = SystemClock.elapsedRealtime()
+        sizes.awaitFirst(n)
+        val strip = detectStrip(List(n) { sizes.known(it) })
+        Log.i(
+            TAG,
+            "strip detection took ${SystemClock.elapsedRealtime() - started} ms ($n sampled): " +
+                "strip=$strip",
+        )
+        isStrip = strip
+        val s = state ?: return
+        // A manual choice made during the detection wins; Auto re-resolves with the strip
+        // decision (an orientation change re-resolves through [onViewport]).
+        state = s.copy(layout = resolvedLayout(s.layoutChoice), detecting = false)
+        recomputeUnits()
+        scheduleWindowUpdate()
     }
 
     /**
@@ -278,12 +324,25 @@ class ReaderViewModel : ViewModel() {
         state = s.copy(overlayVisible = !s.overlayVisible)
     }
 
-    /** Records the viewport and re-renders when it changes; non-positive sizes are ignored. */
+    /**
+     * Records the viewport and re-renders when it changes; non-positive sizes are ignored. While
+     * the layout choice is Auto, a viewport change (a rotation) re-runs the orientation rule: the
+     * strip decision is kept (it does not depend on the orientation), landscape resolves TwoPage
+     * and portrait Single, keeping the book page (through [recomputeUnits]).
+     */
     fun onViewport(w: Int, h: Int) {
         if (w <= 0 || h <= 0) return
         if (w == viewW && h == viewH) return
         viewW = w
         viewH = h
+        val s = state
+        if (s != null && s.layoutChoice == LayoutChoice.Auto) {
+            val newLayout = resolvedLayout(s.layoutChoice)
+            if (newLayout != s.layout) {
+                state = s.copy(layout = newLayout)
+                recomputeUnits()
+            }
+        }
         scheduleWindowUpdate()
     }
 
@@ -298,14 +357,13 @@ class ReaderViewModel : ViewModel() {
     }
 
     /**
-     * The layout for a layout choice. Auto resolves to Single until Task 6 adds strip detection
-     * ([resolveLayout] with a real `isStrip`) and the orientation re-resolution in [onViewport].
+     * The layout for a layout choice: a manual choice always wins; [LayoutChoice.Auto] applies
+     * the detection rules ([resolveLayout]) with the current strip decision and viewport. While
+     * the detection is still running (`isStrip == null`) it resolves as if not a strip, i.e. by
+     * orientation — and [detectStripMode] re-resolves once the decision is in.
      */
-    private fun resolvedLayout(choice: LayoutChoice): Layout = when (choice) {
-        LayoutChoice.Auto, LayoutChoice.Single -> Layout.Single
-        LayoutChoice.TwoPage -> Layout.TwoPage
-        LayoutChoice.Webtoon -> Layout.Webtoon
-    }
+    private fun resolvedLayout(choice: LayoutChoice): Layout =
+        resolveLayout(choice, isStrip ?: false, viewW, viewH)
 
     /**
      * Rebuilds [units] from the current state, keeping the reader on the same book page (its
@@ -349,6 +407,10 @@ class ReaderViewModel : ViewModel() {
         viewModelScope.launch(Dispatchers.Main) {
             updatePending = false
             val s = state ?: return@launch
+            // The strip detection is still running: the layout may still change (a strip book
+            // flips to Webtoon, a landscape viewport to TwoPage), so no window update happens
+            // before it has finished — the reader shows the Single layout's loading state.
+            if (s.detecting) return@launch
             // A closed book (release, or a close that raced a scheduled update) can serve neither
             // new targets nor a prefetch hint; its slots already carry the failure.
             if (book?.isClosed == true) return@launch
@@ -377,6 +439,9 @@ class ReaderViewModel : ViewModel() {
     }
 
     private fun releaseResources() {
+        detectJob?.cancel()
+        detectJob = null
+        isStrip = null
         sizesJob?.cancel()
         sizesJob = null
         sizes?.close()
@@ -398,3 +463,6 @@ class ReaderViewModel : ViewModel() {
 /** Units kept rendered ahead of / behind the current one. */
 private const val WINDOW_AHEAD = 3
 private const val WINDOW_BEHIND = 1
+
+/** Log tag for the reader's own reconciliation (strip detection timing, later additions). */
+private const val TAG = "ReaderVM"

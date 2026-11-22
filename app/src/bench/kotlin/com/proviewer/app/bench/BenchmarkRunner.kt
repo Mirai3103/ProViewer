@@ -18,6 +18,7 @@ import com.proviewer.app.reader.PageSlot
 import com.proviewer.app.reader.Part
 import com.proviewer.app.reader.ReaderAutomation
 import com.proviewer.app.reader.ReaderViewModel
+import com.proviewer.app.reader.LayoutChoice
 import com.proviewer.app.reader.SplitChoice
 import com.proviewer.app.reader.UnitPart
 import kotlinx.coroutines.CancellationException
@@ -282,8 +283,10 @@ class BenchmarkRunner(
             }
             probe.clear()
             vm.attach(opened, strategy)
-            // a3-huge opens huge-single, whose page is wide: pin Split Off, because the scenarios
-            // read the whole-page unit and Auto would split it (auto-selection arrives in Task 6).
+            // Pin the layout every scenario assumes (Single; Auto would resolve it for these
+            // books too, but the pin keeps that explicit) and Split Off, because a3-huge opens
+            // huge-single, whose page is wide, and the scenarios read the whole-page unit.
+            vm.setLayoutChoice(LayoutChoice.Single)
             vm.setSplit(SplitChoice.Off)
             val automation = withTimeout(READER_TIMEOUT_MS) { gate.await() }
             awaitReaderReady(vm)
