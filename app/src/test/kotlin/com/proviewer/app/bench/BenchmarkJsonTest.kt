@@ -59,7 +59,7 @@ class BenchmarkJsonTest {
         )
         val json = JSONObject(toJson(r))
 
-        assertEquals(1, json.getInt("schemaVersion"))
+        assertEquals(2, json.getInt("schemaVersion"))
         assertEquals(CorpusGenerator.MARKER, json.getString("generator"))
         assertTrue(json.getBoolean("validForPerformance"))
         assertEquals("0.1.0", json.getString("appVersion"))
@@ -112,6 +112,53 @@ class BenchmarkJsonTest {
         assertEquals(9.0, prefetched.getDouble("maxMs"), 1e-9)
 
         assertEquals("b", scenarios.getJSONObject(1).getString("id"))
+
+        // a2 records no Webtoon-only information fields: they serialize as JSON null.
+        assertTrue(s.isNull("placeholderFrames"))
+        assertTrue(s.isNull("peakImageBytes"))
+    }
+
+    @Test
+    fun schema_2_has_a1_and_info_fields() {
+        val a1 = ScenarioResult(
+            id = "a1",
+            strategy = UploadStrategy.Software,
+            order = 0,
+            refreshBeforeHz = 120f,
+            refreshAfterHz = 120f,
+            thermalEnd = 0,
+            frames = JankSummary(500, 5, 1.0, p50Ms = 7.0, p95Ms = 14.0, p99Ms = 18.0),
+            cold = null,
+            prefetched = null,
+            fellBackToSoftware = false,
+            aborted = null,
+            placeholderFrames = 12,
+            peakImageBytes = 123_456_789L,
+        )
+        val json = JSONObject(
+            toJson(result(scenarios = listOf(a1, scenario(id = "b", order = 1)))),
+        )
+
+        assertEquals(2, json.getInt("schemaVersion"))
+        val s = json.getJSONArray("scenarios").getJSONObject(0)
+        assertEquals("a1", s.getString("id"))
+        assertEquals(12, s.getInt("placeholderFrames"))
+        assertEquals(123_456_789L, s.getLong("peakImageBytes"))
+        // The b row carries no Webtoon-only fields: they stay JSON null, not absent.
+        val b = json.getJSONArray("scenarios").getJSONObject(1)
+        assertTrue(b.isNull("placeholderFrames"))
+        assertTrue(b.isNull("peakImageBytes"))
+    }
+
+    @Test
+    fun b_prefetched_has_no_fallback_flag() {
+        val json = JSONObject(toJson(result(scenarios = listOf(scenario(id = "b")))))
+
+        val prefetched = json.getJSONArray("scenarios").getJSONObject(0).getJSONObject("prefetched")
+        // Since the strict t1 (snapped turns; E5) a prefetched sample can no longer fall back to
+        // the settled time, so the summary carries exactly the schema's four fields — no
+        // per-sample fallback flag.
+        assertEquals(setOf("n", "p50Ms", "p95Ms", "maxMs"), prefetched.keys().asSequence().toSet())
     }
 
     @Test
@@ -178,6 +225,8 @@ class BenchmarkJsonTest {
         assertTrue(s.isNull("frames"))
         assertTrue(s.isNull("cold"))
         assertTrue(s.isNull("prefetched"))
+        assertTrue(s.isNull("placeholderFrames"))
+        assertTrue(s.isNull("peakImageBytes"))
         assertEquals("Software", s.getString("strategy"))
         assertTrue(s.getBoolean("fellBackToSoftware"))
         assertEquals(1, s.getInt("thermalEnd"))

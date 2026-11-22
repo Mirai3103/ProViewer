@@ -18,9 +18,11 @@ import com.proviewer.app.reader.PageSlot
 import com.proviewer.app.reader.Part
 import com.proviewer.app.reader.ReaderAutomation
 import com.proviewer.app.reader.ReaderViewModel
+import com.proviewer.app.reader.Layout
 import com.proviewer.app.reader.LayoutChoice
 import com.proviewer.app.reader.SplitChoice
 import com.proviewer.app.reader.UnitPart
+import com.proviewer.app.reader.webtoon.TileSlot
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.NonCancellable
@@ -146,6 +148,7 @@ class BenchmarkRunner(
 
     private suspend fun executeRun(onProgress: (String) -> Unit): BenchmarkResult {
         val runNumber = nextRunNumber()
+        val runStarted = SystemClock.elapsedRealtime()
         val strategies = if (runNumber % 2 == 1) {
             listOf(UploadStrategy.Software, UploadStrategy.Hardware)
         } else {
@@ -186,6 +189,8 @@ class BenchmarkRunner(
                     prefetched = outcome.prefetchedMs?.let(::latencySummary),
                     fellBackToSoftware = outcome.fellBackToSoftware,
                     aborted = outcome.aborted,
+                    placeholderFrames = outcome.placeholderFrames,
+                    peakImageBytes = outcome.peakImageBytes,
                 )
                 scenarioResults += scenario
                 Log.i(
@@ -193,6 +198,8 @@ class BenchmarkRunner(
                     "scenario $id [$strategy] order=$order: ${durationMs} ms, " +
                         "frames=${scenario.frames?.frames ?: 0}, cold=${scenario.cold?.n ?: 0}, " +
                         "prefetched=${scenario.prefetched?.n ?: 0}, fellBack=${scenario.fellBackToSoftware}, " +
+                        "placeholders=${scenario.placeholderFrames ?: "-"}, " +
+                        "peakBytes=${scenario.peakImageBytes ?: "-"}, " +
                         "aborted=${scenario.aborted}",
                 )
                 val total = strategies.size * BENCH_SCENARIO_IDS.size
@@ -206,7 +213,12 @@ class BenchmarkRunner(
             gitSha = BuildConfig.GIT_SHA,
             corpusScale = scale,
             scenarios = scenarioResults,
-        ).also { _result.value = it }
+        ).also {
+            _result.value = it
+            // The ≤ 4-minute total is the owner's-device target (spec 6.6); the log makes the
+            // run's wall time comparable wherever it ran (never a performance number itself).
+            Log.i(TAG, "benchmark run wall time: ${SystemClock.elapsedRealtime() - runStarted} ms")
+        }
     }
 
     /**
@@ -245,6 +257,7 @@ class BenchmarkRunner(
         corpus: Map<String, File>,
         onProgress: (String) -> Unit,
     ): ScenarioOutcome = when (id) {
+        "a1" -> scenarioA1(ScenarioEnv(strategy), corpus.getValue("webtoon-long.cbz"))
         "a2" -> scenarioA2(ScenarioEnv(strategy), corpus.getValue("mixed-small.cbz"))
         "a3-screentone" -> scenarioA3(ScenarioEnv(strategy), corpus.getValue("screentone.cbz"), id)
         "a3-huge" -> scenarioA3(ScenarioEnv(strategy), corpus.getValue("huge-single.cbz"), id)
@@ -262,11 +275,14 @@ class BenchmarkRunner(
     /**
      * Opens [file] fresh (via the production [BookOpener], off-main), attaches it to a brand-new
      * reader ViewModel under [strategy], hosts the real ReaderScreen until the block returns, and
-     * releases everything afterwards — no books leak between scenarios or samples.
+     * releases everything afterwards — no books leak between scenarios or samples. With
+     * [webtoon] the layout choice stays at Auto (a strip book auto-resolves Webtoon, a1's
+     * "auto Webtoon"); otherwise the Single layout is pinned as every pager scenario assumes.
      */
     private suspend fun <T> withFreshReader(
         strategy: UploadStrategy,
         file: File,
+        webtoon: Boolean = false,
         block: suspend (ReaderViewModel, ReaderAutomation) -> T,
     ): T {
         val vm = ReaderViewModel()
@@ -283,10 +299,13 @@ class BenchmarkRunner(
             }
             probe.clear()
             vm.attach(opened, strategy)
-            // Pin the layout every scenario assumes (Single; Auto would resolve it for these
-            // books too, but the pin keeps that explicit) and Split Off, because a3-huge opens
-            // huge-single, whose page is wide, and the scenarios read the whole-page unit.
-            vm.setLayoutChoice(LayoutChoice.Single)
+            // Pin the layout every pager scenario assumes (Single; Auto would resolve it for
+            // these books too, but the pin keeps that explicit) and Split Off, because a3-huge
+            // opens huge-single, whose page is wide, and the scenarios read the whole-page unit.
+            // a1 runs the auto-resolved Webtoon layout instead, so the pin is skipped there.
+            if (!webtoon) {
+                vm.setLayoutChoice(LayoutChoice.Single)
+            }
             vm.setSplit(SplitChoice.Off)
             val automation = withTimeout(READER_TIMEOUT_MS) { gate.await() }
             awaitReaderReady(vm)
@@ -297,24 +316,35 @@ class BenchmarkRunner(
     }
 
     /**
-     * Waits until the reader is attached, laid out, has drawn page 0 sharp, and the render window
-     * is idle — "page 0 is idle" for every scenario's start. Generous real-time budget.
+     * Waits until the reader is attached and idle at its resolved layout — "page 0 is idle" for
+     * every scenario's start: the pager layouts need page 0 drawn sharp and the render window
+     * idle; the Webtoon layout needs the session's first tiles ready and no render in flight.
+     * Generous real-time budget.
      */
     private suspend fun awaitReaderReady(vm: ReaderViewModel) {
         val deadline = SystemClock.elapsedRealtime() + READER_TIMEOUT_MS
         while (true) {
-            val settled = vm.state != null &&
-                vm.viewport != null &&
-                vm.window?.slots?.get(UnitPart(0, Part.Whole)) is PageSlot.Ready &&
-                probe.hasSharpDraw(0)
-            if (settled) {
-                vm.window?.awaitIdle()
-                if (vm.window?.slots?.get(UnitPart(0, Part.Whole)) is PageSlot.Ready) return
+            if (vm.state?.layout == Layout.Webtoon) {
+                val tiles = vm.webtoon?.tiles?.tiles
+                if (vm.viewport != null && tiles?.values?.any { it is TileSlot.Ready } == true) {
+                    vm.webtoon?.tiles?.awaitIdle()
+                    return
+                }
+            } else {
+                val settled = vm.state != null &&
+                    vm.viewport != null &&
+                    vm.window?.slots?.get(UnitPart(0, Part.Whole)) is PageSlot.Ready &&
+                    probe.hasSharpDraw(0)
+                if (settled) {
+                    vm.window?.awaitIdle()
+                    if (vm.window?.slots?.get(UnitPart(0, Part.Whole)) is PageSlot.Ready) return
+                }
             }
             if (SystemClock.elapsedRealtime() >= deadline) {
                 throw IllegalStateException(
                     "reader never became ready: state=${vm.state}, viewport=${vm.viewport}, " +
-                        "slot=${vm.window?.slots?.get(UnitPart(0, Part.Whole))}",
+                        "slot=${vm.window?.slots?.get(UnitPart(0, Part.Whole))}, " +
+                        "webtoon=${vm.webtoon != null}",
                 )
             }
             delay(READY_POLL_MS)
@@ -364,8 +394,9 @@ class BenchmarkRunner(
         override fun abortCheckpoint() = this@BenchmarkRunner.abortCheckpoint()
         override suspend fun <T> withFreshReader(
             file: File,
+            webtoon: Boolean,
             block: suspend (ReaderViewModel, ReaderAutomation) -> T,
-        ): T = this@BenchmarkRunner.withFreshReader(strategy, file, block)
+        ): T = this@BenchmarkRunner.withFreshReader(strategy, file, webtoon, block)
     }
 
     private companion object {

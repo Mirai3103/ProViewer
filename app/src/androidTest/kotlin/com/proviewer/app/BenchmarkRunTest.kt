@@ -1,6 +1,7 @@
 package com.proviewer.app
 
 import androidx.activity.ComponentActivity
+import android.os.SystemClock
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.junit4.v2.createAndroidComposeRule
@@ -58,22 +59,27 @@ class BenchmarkRunTest {
     private fun fullRun(runner: BenchmarkRunner) {
         composeRule.setContent { BenchmarkScreen(onBack = {}, runner = runner) }
 
+        val runStartedMs = SystemClock.elapsedRealtime()
         composeRule.onNodeWithTag("bench-start").performClick()
         // Start is confirmed by the runner flipping to running; the end by it flipping back.
         composeRule.waitUntil(60_000) { runner.running.value }
         composeRule.waitUntil(RUN_TIMEOUT_MS) { !runner.running.value }
+        // The ≤ 4-minute total is the owner's-device target (spec 6.6); the emulator's wall time
+        // is printed so the harness's duration stays visible (never a performance result).
+        val wallMs = SystemClock.elapsedRealtime() - runStartedMs
+        println("BENCHMARK RUN WALL TIME (emulator, scale 0.25): ${wallMs} ms")
 
         val result = runner.result.value
         assertNotNull("run produced no result (check bench-progress for the failure)", result)
 
         val json = JSONObject(toJson(result!!))
-        assertEquals(1, json.getInt("schemaVersion"))
+        assertEquals(2, json.getInt("schemaVersion"))
         assertEquals(0.25, json.getDouble("corpusScale"), 1e-9)
         assertTrue("emulator must flag isEmulator", json.getJSONObject("conditions").getBoolean("isEmulator"))
         assertFalse("emulator results are never valid for performance", json.getBoolean("validForPerformance"))
 
         val scenarios = json.getJSONArray("scenarios")
-        assertEquals("all 4 scenario ids x 2 strategies must be present", 8, scenarios.length())
+        assertEquals("all 5 scenario ids x 2 strategies must be present", 10, scenarios.length())
         val seen = mutableSetOf<String>()
         for (i in 0 until scenarios.length()) {
             val s = scenarios.getJSONObject(i)
@@ -81,6 +87,20 @@ class BenchmarkRunTest {
             seen += label
             assertTrue("$label must not abort on a clean run", s.isNull("aborted"))
             when (s.getString("id")) {
+                "a1" -> {
+                    assertTrue(
+                        "$label must record frames on API 37",
+                        s.getJSONObject("frames").getInt("frames") > 0,
+                    )
+                    assertTrue(
+                        "$label must report the placeholder count (0 or more)",
+                        s.getInt("placeholderFrames") >= 0,
+                    )
+                    assertTrue(
+                        "$label must report the image budget's peak bytes",
+                        s.getLong("peakImageBytes") > 0,
+                    )
+                }
                 "a2", "a3-screentone", "a3-huge" -> assertTrue(
                     "$label must record frames on API 37",
                     s.getJSONObject("frames").getInt("frames") > 0,
@@ -91,7 +111,7 @@ class BenchmarkRunTest {
                 }
             }
         }
-        val expected = setOf("a2", "a3-screentone", "a3-huge", "b")
+        val expected = setOf("a1", "a2", "a3-screentone", "a3-huge", "b")
             .flatMap { id -> listOf("Software", "Hardware").map { "$id/$it" } }
             .toSet()
         assertEquals(expected, seen)
