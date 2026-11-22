@@ -115,6 +115,10 @@ class BenchmarkRunTest {
             .flatMap { id -> listOf("Software", "Hardware").map { "$id/$it" } }
             .toSet()
         assertEquals(expected, seen)
+
+        // The on-screen results table shows the a1 rows (one per strategy).
+        composeRule.onNodeWithText("a1 [Software]", substring = true).assertExists()
+        composeRule.onNodeWithText("a1 [Hardware]", substring = true).assertExists()
     }
 
     @Test
