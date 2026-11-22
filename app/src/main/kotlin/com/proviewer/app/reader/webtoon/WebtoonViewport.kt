@@ -99,6 +99,9 @@ private const val ZOOM_MS = 200
 /** Flings below this screen-px/s velocity (e.g. the tail of a tap) do not start a decay. */
 private const val MIN_FLING_VELOCITY = 50f
 
+/** The reason a page whose size probe failed shows under its "Page n" label. */
+private const val PROBE_FAILED_REASON = "size probe failed"
+
 /** The viewport's background while no tile covers an area, and the error placeholder colour. */
 private val PLACEHOLDER_COLOR = Color(0xFF111111)
 
@@ -173,10 +176,10 @@ class WebtoonSession(
  *
  * Drawing per visible page: the 1x tiles underneath while zoomed, the settled-level tiles over
  * them, and the dark placeholder ([PLACEHOLDER_COLOR]) wherever no ready tile covers the area;
- * a failed page ([TileManager.failedPages], sticky for the session) draws the placeholder with
- * "Page n" and the failure's reason, and scrolling continues past it. Tile placement reuses the
- * page-relative scales with one shared rounding per boundary, so neighbouring tiles and adjacent
- * pages abut exactly — no seam, gap or 1-px jump.
+ * a failed page ([TileManager.failedPages], sticky for the session, or a page whose size probe
+ * failed) draws the placeholder with "Page n" and the failure's reason, and scrolling continues
+ * past it. Tile placement reuses the page-relative scales with one shared rounding per boundary,
+ * so neighbouring tiles and adjacent pages abut exactly — no seam, gap or 1-px jump.
  *
  * Gestures: drag scrolls 1:1 (divided by the zoom) and pans horizontally while zoomed; a release
  * flings through a spline decay; pinch zooms the whole column about the fingers' centroid within
@@ -231,6 +234,8 @@ fun WebtoonViewport(
         }
     }
     val lineStep = with(density) { 20.sp.toPx() }
+    // Read at draw time; a probe failure reaches the draw through the layout rebuild it triggers.
+    val probeFailed = remember(vm) { { page: Int -> vm.sizes?.failed(page) == true } }
 
     fun cancelAnim() {
         animJob.value?.cancel()
@@ -247,31 +252,44 @@ fun WebtoonViewport(
     fun startFling(velocityY: Float) {
         cancelAnim()
         animJob.value = scope.launch {
+            // The animation runs on its own travelled-distance coordinate and applies per-frame
+            // deltas: a layout rebuild mid-fling moves scrollY to keep the anchor, and writing
+            // the animation's absolute value back would undo that correction.
+            var last = 0f
             animateDecay(
-                initialValue = session.scrollY.toFloat(),
+                initialValue = 0f,
                 // animateDecay grows the value with a positive velocity, while the drag grows
                 // scrollY with a negative finger velocity: negate to continue the drag.
                 initialVelocity = -velocityY / session.zoom,
                 animationSpec = decay,
             ) { value, _ ->
-                session.scrollY = value.toDouble()
+                val step = value - last
+                last = value
+                session.scrollY = (session.scrollY + step)
                     .coerceIn(0.0, session.layout.maxScroll(session.zoom))
             }
         }
     }
 
-    /** Animates the scroll to [target] (clamped), one tap/volume page. */
+    /**
+     * Animates the scroll to [target] (clamped), one tap/volume page. Per-frame deltas, like
+     * [startFling]: a rebuild's anchor correction mid-animation shifts the end with the content.
+     */
     suspend fun animateScrollTo(target: Double) {
         val max = session.layout.maxScroll(session.zoom)
         val to = target.coerceIn(0.0, max)
         val from = session.scrollY
         if (to == from) return
+        var last = 0f
         animate(
-            initialValue = from.toFloat(),
-            targetValue = to.toFloat(),
+            initialValue = 0f,
+            targetValue = (to - from).toFloat(),
             animationSpec = tween(TAP_SCROLL_MS),
         ) { value, _ ->
-            session.scrollY = value.toDouble().coerceIn(0.0, max)
+            val step = value - last
+            last = value
+            session.scrollY = (session.scrollY + step)
+                .coerceIn(0.0, session.layout.maxScroll(session.zoom))
         }
     }
 
@@ -304,13 +322,16 @@ fun WebtoonViewport(
         if (!animate || target == startZoom) {
             applyZoom(target, focal, contentX, contentY)
         } else {
+            // The focal content point is held as a layout anchor and re-resolved every frame, so
+            // a rebuild mid-zoom (heights above landing) moves it with the content.
+            val anchor = session.layout.anchorAt(contentY)
             animJob.value = scope.launch {
                 animate(
                     initialValue = startZoom,
                     targetValue = target,
                     animationSpec = tween(ZOOM_MS),
                 ) { z, _ ->
-                    applyZoom(z, focal, contentX, contentY)
+                    applyZoom(z, focal, contentX, session.layout.yOf(anchor))
                 }
             }
         }
@@ -440,10 +461,13 @@ fun WebtoonViewport(
             var lastTick = -1
             var lastScroll = session.scrollY
             snapshotFlow {
-                Triple(
+                // The layout is part of the key: a rebuild that leaves scrollY alone (a visible
+                // page's size landing where the estimate was right) still changes the wanted tiles.
+                WantedKey(
                     WebtoonView(session.scrollY, session.zoom, session.panX),
                     settledLevel,
                     session.refreshTick,
+                    session.layout,
                 )
             }.collect { (view, level, tick) ->
                 if (view.scrollY != lastScroll) forwardState.value = view.scrollY > lastScroll
@@ -468,7 +492,7 @@ fun WebtoonViewport(
         // working set: tiles outside it are evicted (during scrolling they are kept as the first
         // eviction candidates instead).
         launch {
-            snapshotFlow { Triple(session.scrollY, session.zoom, session.panX) }
+            snapshotFlow { SettleKey(session.scrollY, session.zoom, session.panX, session.layout) }
                 .debounce(WEBTOON_SETTLE_MS)
                 .collect {
                     val view = WebtoonView(session.scrollY, session.zoom, session.panX)
@@ -609,19 +633,30 @@ fun WebtoonViewport(
                 )
             }
             .drawBehind {
-                drawWebtoon(session, settledLevel, titlePaint, reasonPaint, lineStep) {
+                drawWebtoon(session, settledLevel, titlePaint, reasonPaint, lineStep, probeFailed) {
                     probe.onPlaceholderDrawn()
                 }
             },
     ) {
         // Error placeholders live in the draw phase (their position follows the scroll); expose
-        // each failed page as a tag node so tests can address it (the visible-area proof is the
-        // probe's onPlaceholderDrawn).
-        session.tiles.failedPages.forEach { (page, _) ->
+        // each failed page (tile failures and failed size probes) as a tag node so tests can
+        // address it (the visible-area proof is the probe's onPlaceholderDrawn). Reading the
+        // sizes version subscribes to probe failures, which land with a version bump.
+        val probeFailedPages = run {
+            vm.sizes?.version
+            vm.sizes?.failedPages().orEmpty()
+        }
+        (session.tiles.failedPages.keys + probeFailedPages).toSortedSet().forEach { page ->
             Box(Modifier.testTag("reader-error-$page"))
         }
     }
 }
+
+/** The wanted-tiles flow's key: the view, the settled level, the retry tick and the layout. */
+private data class WantedKey(val view: WebtoonView, val level: Int, val tick: Int, val layout: WebtoonLayout)
+
+/** The settle trim's key: the transform and the layout it was computed on. */
+private data class SettleKey(val scrollY: Double, val zoom: Float, val panX: Float, val layout: WebtoonLayout)
 
 /** Inputs a layout rebuild depends on; a change re-runs the rebuild. */
 private data class RebuildKey(val size: IntSize, val sizesVersion: Int, val failedCount: Int)
@@ -632,7 +667,9 @@ private class PinchBasis(val span: Float, val zoom: Float)
 /**
  * The draw-phase body: failed pages' error placeholders first, then the dark under-layer for
  * visible areas no ready tile covers, then the tiles (1x underneath while zoomed, settled level
- * over them). [onPlaceholder] fires once per frame that drew a placeholder in the visible area.
+ * over them). A failed page is one whose tile render failed ([TileManager.failedPages], with the
+ * engine's reason) or whose size probe failed ([probeFailed], "size probe failed"). [onPlaceholder]
+ * fires once per frame that drew a placeholder in the visible area.
  */
 private fun DrawScope.drawWebtoon(
     session: WebtoonSession,
@@ -640,6 +677,7 @@ private fun DrawScope.drawWebtoon(
     titlePaint: Paint,
     reasonPaint: Paint,
     lineStep: Float,
+    probeFailed: (Int) -> Boolean,
     onPlaceholder: () -> Unit,
 ) {
     val layout = session.layout
@@ -686,6 +724,8 @@ private fun DrawScope.drawWebtoon(
         for (spec in pageTiles(page, full, level)) {
             val slot = tileSlots[spec.key] as? TileSlot.Ready ?: continue
             val bitmap = slot.image.bitmap ?: continue
+            // A tile released on main (eviction, close) can still be in the slot map this frame.
+            if (bitmap.isRecycled) continue
             val r = spec.rect
             val left = if (r.left == 0) 0.0 else r.left * scaleX
             val right = if (r.right == full.width) layout.viewW.toDouble() else r.right * scaleX
@@ -724,9 +764,13 @@ private fun DrawScope.drawWebtoon(
         return true
     }
 
-    // Failed pages: the sticky error placeholder with the page number and the failure's reason.
+    /** Why [page] shows the error placeholder, or null when it does not. */
+    fun failureReason(page: Int): String? =
+        failedPages[page] ?: if (probeFailed(page)) PROBE_FAILED_REASON else null
+
+    // Failed pages: the error placeholder with the page number and the failure's reason.
     for (page in visible) {
-        val reason = failedPages[page] ?: continue
+        val reason = failureReason(page) ?: continue
         drewPlaceholder = true
         val top = layout.top(page)
         val bottom = top + layout.height(page)
@@ -738,7 +782,7 @@ private fun DrawScope.drawWebtoon(
 
     // Dark under-layer wherever no ready tile covers the visible area.
     for (page in visible) {
-        if (failedPages.containsKey(page)) continue
+        if (failureReason(page) != null) continue
         val covered = coveredAt(page, settledLevel) || (settledLevel != 1000 && coveredAt(page, 1000))
         if (!covered) {
             drewPlaceholder = true
@@ -748,7 +792,7 @@ private fun DrawScope.drawWebtoon(
 
     // Tiles: the 1x fallback underneath while zoomed, the settled-level tiles over it.
     for (page in visible) {
-        if (failedPages.containsKey(page)) continue
+        if (failureReason(page) != null) continue
         if (settledLevel != 1000) drawPage(page, 1000)
         drawPage(page, settledLevel)
     }

@@ -32,6 +32,8 @@ private const val VERSION_BATCH = 16
 class PageSizes(
     private val scope: CoroutineScope,
     private val renderer: PageSourceRenderer,
+    /** Test seam: runs (and may suspend) right before each page's probe starts. */
+    private val beforeProbe: suspend (Int) -> Unit = {},
 ) {
     /** Bumps when new sizes (or failures) became visible through [known] / [failed]. */
     var version: Int by mutableIntStateOf(0)
@@ -58,6 +60,9 @@ class PageSizes(
 
     /** Whether the probe of [page] failed. */
     fun failed(page: Int): Boolean = page in failures
+
+    /** The pages whose probe failed so far (a snapshot; [version] says when it may have grown). */
+    fun failedPages(): Set<Int> = failures.toSet()
 
     /** Starts the background probing. Idempotent. */
     fun start() {
@@ -105,6 +110,7 @@ class PageSizes(
         while (true) {
             val page = nextPage() ?: return
             try {
+                beforeProbe(page)
                 sizes[page] = renderer.probePageSize(page)
             } catch (e: CancellationException) {
                 throw e

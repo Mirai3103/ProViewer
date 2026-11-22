@@ -103,6 +103,12 @@ class ReaderViewModel : ViewModel() {
     internal var webtoonTileSource: TileSource? = null
 
     /**
+     * Test seam: a hook run (it may suspend) right before each page-size probe starts, so a test
+     * can hold a chosen page's probe. Read once at [attach]; set it before the book is attached.
+     */
+    internal var sizesProbeHook: (suspend (Int) -> Unit)? = null
+
+    /**
      * The reader's units (one pager page each), rebuilt from the current sizes, layout, split,
      * shift and direction. Snapshot state: the pager's page count is read from it. Rebuilt only
      * when those inputs change (never on page turns), keeping [ReaderState.page] fixed.
@@ -203,7 +209,7 @@ class ReaderViewModel : ViewModel() {
         // targets and tile renders retry: every release pokes both update paths.
         val budget = ImageBudget(onReleased = { postWindowUpdate(); postWebtoonPoke() })
         val window = PageWindow(viewModelScope, renderer, budget)
-        val sizes = PageSizes(viewModelScope, renderer)
+        val sizes = PageSizes(viewModelScope, renderer, sizesProbeHook ?: {})
         this.book = book
         this.renderer = renderer
         this.budget = budget

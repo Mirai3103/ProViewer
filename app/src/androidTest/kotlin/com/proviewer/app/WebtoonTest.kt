@@ -8,17 +8,20 @@ import android.os.SystemClock
 import android.view.KeyEvent
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.animation.SplineBasedFloatDecayAnimationSpec
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.semantics.getOrNull
 import androidx.compose.ui.test.captureToImage
 import androidx.compose.ui.test.junit4.v2.createComposeRule
+import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performTouchInput
 import androidx.compose.ui.test.doubleClick
 import androidx.compose.ui.test.click
 import androidx.compose.ui.test.swipe
+import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.IntRect
 import androidx.compose.ui.unit.IntSize
 import androidx.test.core.app.ActivityScenario
@@ -208,6 +211,7 @@ class WebtoonTest {
         file: File,
         probe: RecordingProbe,
         tileSource: TileSource? = null,
+        probeHook: (suspend (Int) -> Unit)? = null,
     ): ReaderViewModel {
         val readerVm = ReaderViewModel()
         val scenario = ActivityScenario.launch(ComponentActivity::class.java)
@@ -215,6 +219,7 @@ class WebtoonTest {
         // Installed before attach so the session (created whenever the layout becomes Webtoon,
         // including through auto-detection) is guaranteed to render through it.
         readerVm.webtoonTileSource = tileSource
+        readerVm.sizesProbeHook = probeHook
         showReader(scenario, readerVm, probe)
         composeRule.runOnIdle { readerVm.attach(OpenResult.Opened(openNativeBook(file), file.name)) }
         vm = readerVm
@@ -425,7 +430,45 @@ class WebtoonTest {
         )
     }
 
+    /**
+     * Holds the tile renders of [heldPage] on [gate] (every other page renders at once); a render
+     * released through the gate runs the real source, so a corrupt page then fails exactly when
+     * the test lets it — the way a decode failure lands mid-animation in production.
+     */
+    private class PageGateSource(
+        private val heldPage: Int,
+        private val inner: () -> TileSource?,
+    ) : TileSource {
+        val gate = CompletableDeferred<Unit>()
+        private val heldStarts = AtomicInteger(0)
+
+        override suspend fun renderScaled(page: Int, full: IntSize, rect: IntRect): PageImage {
+            if (page == heldPage) {
+                heldStarts.incrementAndGet()
+                gate.await()
+            }
+            return checkNotNull(inner()) { "tile source not wired" }.renderScaled(page, full, rect)
+        }
+
+        fun heldStarted(): Boolean = heldStarts.get() > 0
+    }
+
     // --- corrupt strip CBZ (strip, corrupt JPEG, strip) -------------------------
+
+    /** A CBZ of three 200x1200 strips where page 1's header is garbage (its size probe fails). */
+    private fun buildBrokenHeaderStripCbz(): File {
+        val dir = File(context.cacheDir, "webtoon-corpus").apply { mkdirs() }
+        val file = File(dir, "broken-header-strip.cbz")
+        val valid = stripJpegBytes(200, 1200)
+        // SOI, then bytes that are no marker segment: no dimensions can be read from it.
+        val brokenHeader = byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 0x00, 0x01, 0x02, 0x03, 0x04, 0x05)
+        ZipOutputStream(file.outputStream()).use { zip ->
+            zip.putNextEntry(ZipEntry("001.jpg")); zip.write(valid); zip.closeEntry()
+            zip.putNextEntry(ZipEntry("002.jpg")); zip.write(brokenHeader); zip.closeEntry()
+            zip.putNextEntry(ZipEntry("003.jpg")); zip.write(valid); zip.closeEntry()
+        }
+        return file
+    }
 
     /** A CBZ of three 200x1200 strips where page 1's JPEG decodes fatally (probe still succeeds). */
     private fun buildCorruptStripCbz(): File {
@@ -810,6 +853,148 @@ class WebtoonTest {
         assertEquals("a failed page must never re-render", started1, counting.startedFor(1))
         val darkAgain = sampleViewportPixel(readerVm, x = 135, y = 100)
         assertEquals(0x111111, darkAgain and 0xFFFFFF)
+    }
+
+    @Test
+    fun probe_failed_page_is_labelled_with_page_number_and_reason() {
+        val readerVm = launchReader(buildBrokenHeaderStripCbz(), RecordingProbe())
+        composeRule.waitUntil(60_000) { readerVm.state != null && readerVm.viewport != null }
+        // Pin Webtoon: the strip detection of a book with an unreadable page is not under test.
+        composeRule.runOnIdle { readerVm.setLayoutChoice(LayoutChoice.Webtoon) }
+        composeRule.waitUntil(60_000) { readerVm.webtoon != null }
+        val session = checkNotNull(readerVm.webtoon)
+
+        // Page 1's header cannot be read: its size probe fails and the rebuilt layout gives it the
+        // fixed error height (shorter than the strips) — a draw-only placeholder until labelled.
+        composeRule.waitUntil(30_000) { readerVm.sizes?.failed(1) == true }
+        composeRule.waitUntil(30_000) { session.layout.height(1) < session.layout.height(0) }
+        scrollTo(readerVm, session.layout.top(1))
+
+        // Like a tile-failed page it exposes a tag node (the tag is how tests and accessibility
+        // address a failed page) ...
+        composeRule.waitUntil(10_000) {
+            composeRule.onAllNodesWithTag("reader-error-1").fetchSemanticsNodes().isNotEmpty()
+        }
+
+        // ... and draws "Page 2" plus the reason on the dark band: some pixel of the band is light
+        // text, where a bare placeholder would be uniformly 0x111111.
+        composeRule.waitForIdle()
+        val band = session.layout.height(1)
+        val width = session.layout.viewW
+        val screen = composeRule.onNodeWithTag("webtoon-viewport").captureToImage()
+        val pixels = IntArray(width * band)
+        screen.readPixels(pixels, startX = 0, startY = 0, width = width, height = band)
+        assertTrue(
+            "the probe-failed page's band must carry its label text, not be a bare dark band",
+            pixels.any { AndroidColor.red(it) > 0x70 },
+        )
+        assertNoScopeErrors()
+    }
+
+    @Test
+    fun rebuild_with_unchanged_scroll_requests_the_newly_known_visible_page() {
+        val target = 480
+        // Every page of many-pages.cbz has the same size, so the median estimate IS the real
+        // height: when the target's size lands the rebuild changes nothing above it and scrollY
+        // stays put. The target's probe is held until the test has the column resting on it.
+        val release = CompletableDeferred<Unit>()
+        val readerVm = launchReader(
+            corpusFile("many-pages.cbz"),
+            RecordingProbe(),
+            probeHook = { page -> if (page == target) release.await() },
+        )
+        composeRule.waitUntil(60_000) { readerVm.state != null && readerVm.viewport != null }
+        composeRule.waitUntil(60_000) {
+            readerVm.state?.detecting == false && readerVm.sizes?.known(0) != null
+        }
+        // many-pages is no strip: pin Webtoon, then jump to the target (still estimated).
+        composeRule.runOnIdle { readerVm.setLayoutChoice(LayoutChoice.Webtoon) }
+        composeRule.waitUntil(60_000) { readerVm.webtoon != null }
+        val session = checkNotNull(readerVm.webtoon)
+        composeRule.waitUntil(30_000) {
+            composeRule.onAllNodesWithTag("webtoon-viewport").fetchSemanticsNodes().isNotEmpty()
+        }
+        composeRule.runOnIdle { readerVm.goTo(target) }
+        composeRule.waitUntil(30_000) { semanticsTopPage() == target }
+        // Everything else has landed and the column is at rest on the estimated target page: no
+        // tile is held, so no budget release can poke a retry — only the rebuild can request it.
+        composeRule.waitUntil(30_000) { (0 until 480).all { readerVm.sizes?.known(it) != null } }
+        awaitTilesIdle(readerVm)
+        assertTrue("precondition: the target is still estimated", session.layout.isEstimated(target))
+        assertTrue(
+            "precondition: no tile of the target exists",
+            session.tiles.tiles.keys.none { it.page == target },
+        )
+        val top = session.layout.top(target)
+        assertEquals(top, session.scrollY, 0.5)
+
+        composeRule.runOnIdle { release.complete(Unit) }
+        composeRule.waitUntil(30_000) { !session.layout.isEstimated(target) }
+        // The premise: the rebuild left scrollY alone.
+        assertEquals("the rebuild must not have moved the scroll", top, session.scrollY, 0.5)
+
+        // The newly known visible page must get its tiles without any touch or scroll.
+        composeRule.waitUntil(20_000) {
+            session.tiles.tiles.values.any { it is TileSlot.Ready && it.spec.key.page == target }
+        }
+        assertNoScopeErrors()
+    }
+
+    @Test
+    fun fling_keeps_the_anchor_correction_of_a_mid_animation_rebuild() {
+        val gating = PageGateSource(heldPage = 1) { vm?.renderer }
+        val readerVm = launchReader(buildCorruptStripCbz(), RecordingProbe(), tileSource = gating)
+        awaitWebtoon(readerVm)
+        val session = checkNotNull(readerVm.webtoon)
+        val auto = webtoonAutomation()
+        composeRule.waitUntil(30_000) { (0..2).all { !session.layout.isEstimated(it) } }
+
+        // Park inside page 2: page 1's bottom is in the prefetch margin, so its (corrupt) render
+        // starts and is held on the gate.
+        scrollTo(readerVm, session.layout.top(2) + 300.0)
+        composeRule.waitUntil(30_000) { gating.heldStarted() }
+        val oldLayout = session.layout
+        val startScroll = session.scrollY
+
+        // Fling down, as fast as the column's remaining room allows (a long decay keeps the
+        // fling running while the page's failure lands). The spline decay's travel and duration
+        // are pure functions of the velocity.
+        val decaySpec = SplineBasedFloatDecayAnimationSpec(Density(context))
+        val room = oldLayout.top(2) + oldLayout.height(2) - oldLayout.viewH - startScroll
+        var velocity = -30_000f
+        while (decaySpec.getTargetValue(0f, -velocity) > room - 300 && velocity < -1000f) velocity += 1000f
+        val travel = decaySpec.getTargetValue(0f, -velocity).toDouble()
+        val durationMs = decaySpec.getDurationNanos(0f, -velocity) / 1_000_000
+        val done = CompletableDeferred<Unit>()
+        mainScope.launch {
+            auto.fling(velocity)
+            done.complete(Unit)
+        }
+        composeRule.waitUntil(15_000) { session.scrollY >= startScroll + 20.0 }
+
+        // Mid-fling the corrupt page's render fails: the page shrinks to the error placeholder
+        // and the rebuild re-anchors scrollY by the (large, negative) height change above it.
+        // (Completed directly: runOnIdle would wait for the running fling to finish first.)
+        gating.gate.complete(Unit)
+        composeRule.waitUntil(30_000) { session.layout.height(1) != oldLayout.height(1) }
+        assertTrue(
+            "the rebuild must land mid-fling (travel=$travel room=$room durationMs=$durationMs " +
+                "viewH=${oldLayout.viewH} h2=${oldLayout.height(2)})",
+            !done.isCompleted,
+        )
+        val newLayout = session.layout
+        val delta = newLayout.top(2) - oldLayout.top(2)
+        assertTrue("page 1 must have shrunk by more than a viewport (delta=$delta)", delta < -1000.0)
+
+        // The fling finishes: the content must have kept its position relative to page 2's top
+        // plus the fling's own travel. Writing the animation's absolute value back would undo the
+        // correction (the viewport jumping by -delta, or clamping to the shorter column's end).
+        composeRule.waitUntil(30_000) { done.isCompleted }
+        composeRule.waitForIdle()
+        val relEnd = session.scrollY - newLayout.top(2)
+        val relExpected = (startScroll - oldLayout.top(2)) + travel
+        assertEquals("the fling must keep the rebuild's anchor correction", relExpected, relEnd, 3.0)
+        assertNoScopeErrors()
     }
 
     // --- zoom and sharp re-render (Task 11) --------------------------------------
