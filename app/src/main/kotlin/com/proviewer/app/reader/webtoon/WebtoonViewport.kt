@@ -82,8 +82,15 @@ val WebtoonScrollYKey = SemanticsPropertyKey<Double>("WebtoonScrollY")
 /** Test semantics: the page currently shown at the viewport's top edge. */
 val WebtoonTopPageKey = SemanticsPropertyKey<Int>("WebtoonTopPage")
 
-/** How long the view must be still before the settle trim drops tiles outside the working set. */
-private const val SETTLE_MS = 150L
+/** The whole-column zoom's upper bound (spec 5.2: the pinch range is 1x-3x, designer's call). */
+const val WEBTOON_MAX_ZOOM = 3f
+
+/**
+ * How long the transform must be still before the view settles: the zoom level sharpens to
+ * [zoomLevel] (the visible tiles re-render at that scale) and the settle trim drops tiles outside
+ * the working set.
+ */
+const val WEBTOON_SETTLE_MS = 150L
 
 /** Duration of a tap/volume-key page scroll and of a double-tap zoom (designer's call). */
 private const val TAP_SCROLL_MS = 200
@@ -172,10 +179,15 @@ class WebtoonSession(
  * pages abut exactly — no seam, gap or 1-px jump.
  *
  * Gestures: drag scrolls 1:1 (divided by the zoom) and pans horizontally while zoomed; a release
- * flings through a spline decay; single taps map through the vertical thirds ([verticalTapAction]
- * via the ViewModel's page turns); double-tap zooms to 2x about the tap and back. A new gesture or
- * command cancels the running scroll/zoom/fling animation; the far `ToPage` jump snaps instead of
- * animating through the column, so passed pages never queue renders.
+ * flings through a spline decay; pinch zooms the whole column about the fingers' centroid within
+ * `[1, WEBTOON_MAX_ZOOM]` (it latches until all fingers are up — a pinch never scrolls the list by
+ * itself and its release never flings); single taps map through the vertical thirds
+ * ([verticalTapAction] via the ViewModel's page turns); double-tap zooms to 2x about the tap and
+ * back. While the transform changes the settled level stays at the previous level (tiles drawn
+ * scaled); after [WEBTOON_SETTLE_MS] of stillness it sharpens to [zoomLevel] and the visible tiles
+ * re-render at that scale — a new gesture before they are done cancels them ([TileManager.update]).
+ * A new gesture or command cancels the running scroll/zoom/fling animation; the far `ToPage` jump
+ * snaps instead of animating through the column, so passed pages never queue renders.
  *
  * A snapshotFlow over the view computes [wantedTiles] and calls [TileManager.update] (main
  * thread) only when the wanted set changes; after the view has been still for the settle delay
@@ -263,26 +275,50 @@ fun WebtoonViewport(
         }
     }
 
-    /** Double-tap: zoom to 2x about the tap, or back to 1x; the focal content point stays put. */
-    fun toggleZoom(focal: Offset) {
+    /**
+     * Sets the zoom to [z], keeping the content point that was under [focal] when its content
+     * coordinates ([contentX], [contentY]) were captured under it: screen x = `X*z - panX` and
+     * screen y = `(Y - scrollY)*z` give `panX = X*z - focal.x` and `scrollY = Y - focal.y/z`,
+     * clamped to the pan and scroll ranges (at a range the focal point drifts — the view cannot
+     * show past the column's edge).
+     */
+    fun applyZoom(z: Float, focal: Offset, contentX: Float, contentY: Double) {
+        session.zoom = z
+        val maxPan = session.layout.viewW * (z - 1f)
+        session.panX = (contentX * z - focal.x).coerceIn(0f, maxPan)
+        session.scrollY = (contentY - focal.y / z)
+            .coerceIn(0.0, session.layout.maxScroll(z))
+    }
+
+    /**
+     * Zooms to [factor] (clamped to `[1, WEBTOON_MAX_ZOOM]`) about [focal] (a viewport position):
+     * the content point under [focal] stays under it. Without [animate] it applies immediately;
+     * with, it animates over [ZOOM_MS]. Cancels any running scroll/zoom/fling animation first.
+     */
+    fun startZoomTo(factor: Float, focal: Offset, animate: Boolean) {
         cancelAnim()
+        val target = factor.coerceIn(1f, WEBTOON_MAX_ZOOM)
         val startZoom = session.zoom
-        val target = if (startZoom > 1.001f) 1f else 2f
         val contentX = (focal.x + session.panX) / startZoom
         val contentY = focal.y / startZoom + session.scrollY
-        animJob.value = scope.launch {
-            animate(
-                initialValue = startZoom,
-                targetValue = target,
-                animationSpec = tween(ZOOM_MS),
-            ) { z, _ ->
-                session.zoom = z
-                val maxPan = session.layout.viewW * (z - 1f)
-                session.panX = (contentX * z - focal.x).coerceIn(0f, maxPan)
-                session.scrollY = (contentY - focal.y / z)
-                    .coerceIn(0.0, session.layout.maxScroll(z))
+        if (!animate || target == startZoom) {
+            applyZoom(target, focal, contentX, contentY)
+        } else {
+            animJob.value = scope.launch {
+                animate(
+                    initialValue = startZoom,
+                    targetValue = target,
+                    animationSpec = tween(ZOOM_MS),
+                ) { z, _ ->
+                    applyZoom(z, focal, contentX, contentY)
+                }
             }
         }
+    }
+
+    /** Double-tap: zoom to 2x about the tap, or back to 1x; the focal content point stays put. */
+    fun toggleZoom(focal: Offset) {
+        startZoomTo(if (session.zoom > 1.001f) 1f else 2f, focal, animate = true)
     }
 
     val automation = remember(session, scope, decay) {
@@ -309,7 +345,11 @@ fun WebtoonViewport(
             }
 
             override suspend fun zoomTo(factor: Float, focal: Offset, animate: Boolean) {
-                TODO("wired with the Webtoon zoom task")
+                withContext(scope.coroutineContext) {
+                    startZoomTo(factor, focal, animate)
+                    // An animated zoom suspends until it has finished, like a fling.
+                    animJob.value?.join()
+                }
             }
         }
     }
@@ -353,12 +393,45 @@ fun WebtoonViewport(
                 }
         }
 
-        // The settled zoom level feeds the wanted tiles' level (the sharp re-render itself is the
-        // zoom task's work; at 1x the level never leaves 1000 and nothing re-renders).
+        // The settled zoom level feeds the wanted tiles' level: while the zoom changes the level
+        // stays where it was (the tiles of the previous level are drawn scaled), and after the
+        // settle delay it sharpens to zoomLevel(zoom) — at 1x it never leaves 1000 and nothing
+        // re-renders.
         launch {
             snapshotFlow { session.zoom }
-                .debounce(SETTLE_MS)
+                .debounce(WEBTOON_SETTLE_MS)
                 .collect { settledLevel = zoomLevel(it) }
+        }
+
+        // The sharp re-render's lifecycle, reported through the probe's pinned vocabulary per
+        // rendered tile above level 1000 (the settled level's tiles): "tiles-start" when its
+        // render starts, "tiles-done" when it lands ready, "tiles-cancelled" when it is cancelled
+        // before that (a new gesture or level supersedes it — TileManager.update drops it). At 1x
+        // the tiles ARE the 1x render — nothing re-renders and no events fire.
+        launch {
+            var previous: Map<TileKey, TileSlot> = emptyMap()
+            snapshotFlow { session.tiles.tiles.toMap() }
+                .collect { tiles ->
+                    for ((key, slot) in tiles) {
+                        if (key.level == 1000) continue
+                        val before = previous[key]
+                        when (slot) {
+                            is TileSlot.Loading -> if (before !is TileSlot.Loading) {
+                                probe.onDetailRender(key.page, "tiles-start")
+                            }
+                            is TileSlot.Ready -> if (before !is TileSlot.Ready) {
+                                probe.onDetailRender(key.page, "tiles-done")
+                            }
+                            is TileSlot.Failed -> Unit
+                        }
+                    }
+                    for ((key, slot) in previous) {
+                        if (slot is TileSlot.Loading && key.level != 1000 && key !in tiles) {
+                            probe.onDetailRender(key.page, "tiles-cancelled")
+                        }
+                    }
+                    previous = tiles
+                }
         }
 
         // Wanted tiles and the page at the viewport's top edge, per view change.
@@ -396,7 +469,7 @@ fun WebtoonViewport(
         // eviction candidates instead).
         launch {
             snapshotFlow { Triple(session.scrollY, session.zoom, session.panX) }
-                .debounce(SETTLE_MS)
+                .debounce(WEBTOON_SETTLE_MS)
                 .collect {
                     val view = WebtoonView(session.scrollY, session.zoom, session.panX)
                     session.tiles.update(
@@ -432,7 +505,7 @@ fun WebtoonViewport(
         // The semantics-reported scroll trails the live value so tests read a settled position.
         launch {
             snapshotFlow { session.scrollY }
-                .debounce(SETTLE_MS)
+                .debounce(WEBTOON_SETTLE_MS)
                 .collect { shownScrollY = it }
         }
     }
@@ -452,26 +525,66 @@ fun WebtoonViewport(
                     cancelAnim()
                     val tracker = VelocityTracker()
                     tracker.addPosition(down.uptimeMillis, down.position)
+                    var pinch: PinchGesture? = null
                     while (true) {
                         val event = awaitPointerEvent()
-                        val change = event.changes.firstOrNull() ?: break
-                        // Feed the tracker on real movement and on the up (the last sample).
-                        if (change.positionChange() != Offset.Zero || change.pressed != change.previousPressed) {
-                            tracker.addPosition(change.uptimeMillis, change.position)
+                        val changes = event.changes
+                        val first = changes.firstOrNull() ?: break
+                        val pressed = changes.filter { it.pressed }
+                        // Feed the tracker on real movement and on the up (the last sample). A
+                        // pinch's tracked velocity is unused: its release never flings.
+                        if (first.positionChange() != Offset.Zero || first.pressed != first.previousPressed) {
+                            tracker.addPosition(first.uptimeMillis, first.position)
                         }
-                        val drag = change.positionChange()
-                        if (drag != Offset.Zero) {
-                            change.consume()
-                            // Drag scrolls 1:1 (divided by the zoom); horizontal drags pan while
-                            // zoomed (the pan range collapses to zero at 1x).
-                            session.scrollY = (session.scrollY - drag.y / session.zoom)
-                                .coerceIn(0.0, session.layout.maxScroll(session.zoom))
-                            val maxPan = session.layout.viewW * (session.zoom - 1f)
-                            session.panX = (session.panX - drag.x).coerceIn(0f, maxPan)
+                        if (pressed.size >= 2) {
+                            // Pinch: zoom about the fingers' centroid within [1, WEBTOON_MAX_ZOOM],
+                            // keeping the focal content point under the centroid (scrollY and panX
+                            // adjusted about it). A pinch never scrolls the list by itself: the
+                            // gesture latches until all fingers are up — no drag scroll and no
+                            // release fling, and a finger left behind does nothing.
+                            changes.forEach { change -> if (change.pressed) change.consume() }
+                            val a = pressed[0].position
+                            val b = pressed[1].position
+                            val span = (a - b).getDistance()
+                            val centroid = Offset((a.x + b.x) / 2f, (a.y + b.y) / 2f)
+                            val prev = pinch
+                            var applied = false
+                            if (prev != null && prev.span > 0.5f && span > 0.5f) {
+                                val zoom = (prev.zoom * span / prev.span)
+                                    .coerceIn(1f, WEBTOON_MAX_ZOOM)
+                                val contentX = (centroid.x + session.panX) / session.zoom
+                                val contentY = centroid.y / session.zoom + session.scrollY
+                                session.zoom = zoom
+                                val maxPan = session.layout.viewW * (zoom - 1f)
+                                session.panX = (contentX * zoom - centroid.x).coerceIn(0f, maxPan)
+                                session.scrollY = (contentY - centroid.y / zoom)
+                                    .coerceIn(0.0, session.layout.maxScroll(zoom))
+                                applied = true
+                            }
+                            pinch = PinchGesture(
+                                span,
+                                if (applied) session.zoom else (prev?.zoom ?: session.zoom),
+                            )
+                        } else if (pressed.size == 1) {
+                            val change = pressed[0]
+                            val drag = change.positionChange()
+                            if (drag != Offset.Zero) {
+                                change.consume()
+                                if (pinch == null) {
+                                    // Drag scrolls 1:1 (divided by the zoom); horizontal drags pan
+                                    // while zoomed (the pan range collapses to zero at 1x).
+                                    session.scrollY = (session.scrollY - drag.y / session.zoom)
+                                        .coerceIn(0.0, session.layout.maxScroll(session.zoom))
+                                    val maxPan = session.layout.viewW * (session.zoom - 1f)
+                                    session.panX = (session.panX - drag.x).coerceIn(0f, maxPan)
+                                }
+                            }
                         }
-                        if (event.changes.all { !it.pressed }) {
-                            val velocity = tracker.calculateVelocity()
-                            if (abs(velocity.y) > MIN_FLING_VELOCITY) startFling(velocity.y)
+                        if (pressed.isEmpty()) {
+                            if (pinch == null) {
+                                val velocity = tracker.calculateVelocity()
+                                if (abs(velocity.y) > MIN_FLING_VELOCITY) startFling(velocity.y)
+                            }
                             break
                         }
                     }
@@ -506,6 +619,9 @@ fun WebtoonViewport(
 
 /** Inputs a layout rebuild depends on; a change re-runs the rebuild. */
 private data class RebuildKey(val size: IntSize, val sizesVersion: Int, val failedCount: Int)
+
+/** A pinch's previous two-finger span and the zoom it mapped to (the next event's ratio basis). */
+private class PinchGesture(val span: Float, val zoom: Float)
 
 /**
  * The draw-phase body: failed pages' error placeholders first, then the dark under-layer for

@@ -59,7 +59,12 @@ interface WebtoonAutomation {
      */
     suspend fun fling(velocityY: Float)
 
-    /** Zooms the whole column to [factor] about [focal] (implemented with the zoom task). */
+    /**
+     * Zooms the whole column to [factor] (clamped to the 1x..3x range) about [focal] (a viewport
+     * position): the content point under [focal] stays under it, within the scroll and pan ranges.
+     * With [animate] the zoom animates and the call suspends until it has finished; without, it
+     * applies immediately.
+     */
     suspend fun zoomTo(factor: Float, focal: Offset, animate: Boolean)
 }
 
