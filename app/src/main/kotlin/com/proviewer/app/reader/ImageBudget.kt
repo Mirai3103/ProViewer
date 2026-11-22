@@ -15,8 +15,16 @@ fun rgbaBytes(w: Int, h: Int): Long = w.toLong() * h * 4
  * Accounting for the bytes of images the reader holds. A holder calls [tryReserve] BEFORE allocating
  * and [release]s the same amount when the image is gone, so [usedBytes] never exceeds [capBytes].
  * Thread-safe and lock-free.
+ *
+ * [onReleased], when given, is invoked after every successful [release] — including the releases
+ * of [wrap]ped images — so the owner can react to bytes that were freed outside its own
+ * accounting (e.g. detail images): whatever was skipped for lack of budget can retry. It may run
+ * on any thread.
  */
-class ImageBudget(val capBytes: Long = IMAGE_CAP_BYTES) {
+class ImageBudget(
+    val capBytes: Long = IMAGE_CAP_BYTES,
+    private val onReleased: (() -> Unit)? = null,
+) {
     private val used = AtomicLong(0)
     private val peak = AtomicLong(0)
 
@@ -45,6 +53,7 @@ class ImageBudget(val capBytes: Long = IMAGE_CAP_BYTES) {
         require(bytes >= 0) { "bytes must not be negative: $bytes" }
         val now = used.addAndGet(-bytes)
         check(now >= 0) { "released more bytes than were reserved" }
+        onReleased?.invoke()
     }
 
     /** Restarts peak tracking from the current [usedBytes]. */

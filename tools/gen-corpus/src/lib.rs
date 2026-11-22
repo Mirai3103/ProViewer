@@ -128,12 +128,13 @@ fn numbered(i: usize, ext: &str) -> String {
     format!("{:03}.{}", i + 1, ext)
 }
 
-/// All seven corpus archive names, in generation order (see `corpus/README.md`).
+/// All eight corpus archive names, in generation order (see `corpus/README.md`).
 pub const ALL_CORPUS_NAMES: &[&str] = &[
     "screentone.cbz",
     "webtoon-long.cbz",
     "huge-single.cbz",
     "double-spread.cbz",
+    "two-page.cbz",
     "mixed-small.cbz",
     "many-pages.cbz",
     "formats-and-names.cbz",
@@ -180,6 +181,18 @@ fn archive_entries(name: &str, scale: f32) -> Result<Vec<(String, Vec<u8>)>> {
                 (numbered(2, "jpg"), encode_jpeg(&portrait(2))?),
                 (numbered(3, "png"), encode_png(&spread(3))?),
             ]
+        }
+        // two-page.cbz: portrait 1-4, spread 5, portrait 6-8. Two adjacent portrait pages let the
+        // two-page pairing rules be observed end to end (cover alone, pairs, spread alone, restart
+        // after the spread, and Shift).
+        "two-page.cbz" => {
+            let mut e = Vec::with_capacity(8);
+            for i in 0..8usize {
+                let (w, h) = if i == 4 { (3200u32, 2400u32) } else { (1600u32, 2400u32) };
+                let page = simple_page(sc(w, scale), sc(h, scale), i as u32);
+                e.push((numbered(i, "jpg"), encode_jpeg(&page)?));
+            }
+            e
         }
         // mixed-small.cbz: 20 pages
         "mixed-small.cbz" => {
@@ -229,7 +242,7 @@ pub fn generate_named(out_dir: &Path, scale: f32, names: &[&str]) -> Result<Vec<
     Ok(written)
 }
 
-/// Generate the seven corpus archives with all pixel dimensions multiplied by `scale`
+/// Generate the eight corpus archives with all pixel dimensions multiplied by `scale`
 /// (minimum 1 px). Entry counts and names do not depend on `scale`.
 pub fn generate_with_scale(out_dir: &Path, scale: f32) -> Result<Vec<PathBuf>> {
     generate_named(out_dir, scale, ALL_CORPUS_NAMES)
@@ -413,6 +426,7 @@ mod tests {
             "webtoon-long.cbz",
             "huge-single.cbz",
             "double-spread.cbz",
+            "two-page.cbz",
             "mixed-small.cbz",
             "many-pages.cbz",
             "formats-and-names.cbz",
@@ -425,6 +439,7 @@ mod tests {
             ("webtoon-long.cbz", 3),
             ("huge-single.cbz", 1),
             ("double-spread.cbz", 4),
+            ("two-page.cbz", 8),
             ("mixed-small.cbz", 20),
             ("many-pages.cbz", 500),
             ("formats-and-names.cbz", 5),
@@ -482,10 +497,11 @@ mod tests {
                 "huge-single.cbz",
                 "mixed-small.cbz",
                 "screentone.cbz",
+                "two-page.cbz",
             ]
         );
 
-        // 6 + 1 + 4 + 20 + 4 image entries (ComicInfo.xml is not an image).
+        // 6 + 1 + 4 + 8 + 20 + 4 image entries (ComicInfo.xml is not an image).
         let mut images = 0;
         let mut exts = std::collections::BTreeSet::new();
         for e in std::fs::read_dir(dir.path().join("decode")).unwrap() {
@@ -504,8 +520,8 @@ mod tests {
             exts.insert(ext);
             images += 1;
         }
-        // 35 extracted image entries plus the two damaged JPEG forms of the first seed.
-        assert_eq!(images, 37);
+        // 43 extracted image entries plus the two damaged JPEG forms of the first seed.
+        assert_eq!(images, 45);
         assert_eq!(exts.len(), 3, "jpg, png and webp seeds are all present");
     }
 

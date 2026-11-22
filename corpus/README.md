@@ -15,6 +15,7 @@ coordinates and the generator arguments, so two runs produce byte-identical arch
 | `webtoon-long.cbz` | 3 strips 800×24000, JPEG | vertical scroll, tiling past max texture size |
 | `huge-single.cbz` | 1 image 12000×8000, JPEG | memory peak, zoom |
 | `double-spread.cbz` | 4 pages: 2 portrait 1600×2400 + 2 spreads 3200×2400 (one spread PNG) | spread splitting |
+| `two-page.cbz` | 8 pages: 7 portrait 1600×2400 + 1 spread 3200×2400 (page 5), JPEG | two-page pairing: cover alone, adjacent portrait pairs, spread alone, restart after the spread, Shift |
 | `mixed-small.cbz` | 20 pages 800×1200, JPEG | paged swipe |
 | `many-pages.cbz` | 500 pages 800×1200, JPEG | open-time benchmark (spec §7) |
 | `formats-and-names.cbz` | 5 entries, stored order: `ComicInfo.xml`, `vol1/page10.webp`, `vol1/page2.png`, `vol1/page1.jpg`, `第3話.jpg` | WebP/gray PNG decode, natural sort, nested dirs, UTF-8 names, non-image skip |

@@ -52,12 +52,6 @@ class PageWindow(
 ) {
     val slots: SnapshotStateMap<UnitPart, PageSlot> = mutableStateMapOf()
 
-    /**
-     * The slot of the whole page [page]: the Phase 2 shaped accessor the one-page-per-unit reader
-     * uses until the unit pager (Task 5) reads [slots] by part itself.
-     */
-    fun wholeSlot(page: Int): PageSlot? = slots[UnitPart(page, Part.Whole)]
-
     /** What a slot's render is for: the part of the page, its bitmap size and its laid-out size. */
     private data class Spec(val src: IntRect, val base: IntSize, val display: IntSize)
 

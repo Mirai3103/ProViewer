@@ -21,10 +21,13 @@ import com.proviewer.app.reader.FitMode
 import com.proviewer.app.reader.LocalReaderProbe
 import com.proviewer.app.reader.PageRegion
 import com.proviewer.app.reader.PageSlot
+import com.proviewer.app.reader.Part
 import com.proviewer.app.reader.ReaderAutomation
 import com.proviewer.app.reader.ReaderProbe
 import com.proviewer.app.reader.ReaderScreen
 import com.proviewer.app.reader.ReaderViewModel
+import com.proviewer.app.reader.SplitChoice
+import com.proviewer.app.reader.UnitPart
 import com.proviewer.app.reader.ZoomAutomation
 import com.proviewer.app.reader.baseSize
 import com.proviewer.app.reader.visibleRegion
@@ -143,7 +146,7 @@ class ZoomTest {
         while (System.currentTimeMillis() < deadline) {
             composeRule.waitForIdle()
             val view = readerVm.viewport!!
-            val ready = (readerVm.window?.wholeSlot(page) as? PageSlot.Ready)?.size
+            val ready = (readerVm.window?.slots?.get(UnitPart(page, Part.Whole)) as? PageSlot.Ready)?.size
             if (view == lastViewport && ready == baseSize(pageW, pageH, view.width, view.height, FitMode.Screen)) {
                 return checkNotNull(ready)
             }
@@ -151,7 +154,8 @@ class ZoomTest {
             Thread.sleep(200)
         }
         throw AssertionError(
-            "page $page never settled; viewport=$lastViewport slot=${readerVm.window?.wholeSlot(page)}",
+            "page $page never settled; viewport=$lastViewport " +
+                "slot=${readerVm.window?.slots?.get(UnitPart(page, Part.Whole))}",
         )
     }
 
@@ -168,7 +172,7 @@ class ZoomTest {
         contentLeft: Float,
         contentTop: Float,
     ): PageRegion {
-        val slot = readerVm.window!!.wholeSlot(page) as PageSlot.Ready
+        val slot = readerVm.window!!.slots.getValue(UnitPart(page, Part.Whole)) as PageSlot.Ready
         val info = readerVm.book!!.pageInfo(page)
         val view = readerVm.viewport!!
         return checkNotNull(
@@ -369,13 +373,16 @@ class ZoomTest {
     fun max_zoom_reaches_source_pixels() {
         val probe = RecordingProbe()
         val readerVm = launchReader(corpusFile("huge-single.cbz"), probe)
+        // huge-single's one page is wide (12000x8000): pin Split Off, because this test reads the
+        // whole-page unit and Auto would split it (auto-selection itself arrives in Task 6).
+        composeRule.runOnIdle { readerVm.setSplit(SplitChoice.Off) }
         awaitReadyAndSettled(readerVm)
         val zoom = zoomAutomation()
 
         val info = readerVm.book!!.pageInfo(0)
         val pageW = info.width.toInt()
         val pageH = info.height.toInt()
-        val base = (readerVm.window!!.wholeSlot(0) as PageSlot.Ready).size
+        val base = (readerVm.window!!.slots.getValue(UnitPart(0, Part.Whole)) as PageSlot.Ready).size
         val maxZoom = max(4f, pageW / base.width.toFloat())
 
         // Zoom far past the limit; the state coerces to the spec maximum.

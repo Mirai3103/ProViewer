@@ -15,8 +15,11 @@ import com.proviewer.app.engine.UploadStrategy
 import com.proviewer.app.open.BookOpener
 import com.proviewer.app.open.OpenResult
 import com.proviewer.app.reader.PageSlot
+import com.proviewer.app.reader.Part
 import com.proviewer.app.reader.ReaderAutomation
 import com.proviewer.app.reader.ReaderViewModel
+import com.proviewer.app.reader.SplitChoice
+import com.proviewer.app.reader.UnitPart
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.NonCancellable
@@ -279,6 +282,9 @@ class BenchmarkRunner(
             }
             probe.clear()
             vm.attach(opened, strategy)
+            // a3-huge opens huge-single, whose page is wide: pin Split Off, because the scenarios
+            // read the whole-page unit and Auto would split it (auto-selection arrives in Task 6).
+            vm.setSplit(SplitChoice.Off)
             val automation = withTimeout(READER_TIMEOUT_MS) { gate.await() }
             awaitReaderReady(vm)
             return block(vm, automation)
@@ -296,16 +302,16 @@ class BenchmarkRunner(
         while (true) {
             val settled = vm.state != null &&
                 vm.viewport != null &&
-                vm.window?.wholeSlot(0) is PageSlot.Ready &&
+                vm.window?.slots?.get(UnitPart(0, Part.Whole)) is PageSlot.Ready &&
                 probe.hasSharpDraw(0)
             if (settled) {
                 vm.window?.awaitIdle()
-                if (vm.window?.wholeSlot(0) is PageSlot.Ready) return
+                if (vm.window?.slots?.get(UnitPart(0, Part.Whole)) is PageSlot.Ready) return
             }
             if (SystemClock.elapsedRealtime() >= deadline) {
                 throw IllegalStateException(
                     "reader never became ready: state=${vm.state}, viewport=${vm.viewport}, " +
-                        "slot=${vm.window?.wholeSlot(0)}",
+                        "slot=${vm.window?.slots?.get(UnitPart(0, Part.Whole))}",
                 )
             }
             delay(READY_POLL_MS)

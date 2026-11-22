@@ -27,10 +27,14 @@ import com.proviewer.app.bench.CorpusGenerator
 import com.proviewer.app.engine.NativeBook
 import com.proviewer.app.open.OpenResult
 import com.proviewer.app.reader.FitMode
+import com.proviewer.app.reader.LayoutChoice
 import com.proviewer.app.reader.PageSlot
+import com.proviewer.app.reader.Part
 import com.proviewer.app.reader.ReaderAutomation
 import com.proviewer.app.reader.ReaderScreen
 import com.proviewer.app.reader.ReaderViewModel
+import com.proviewer.app.reader.SplitChoice
+import com.proviewer.app.reader.UnitPart
 import com.proviewer.app.reader.ZoomAutomation
 import com.proviewer.app.reader.baseSize
 import kotlinx.coroutines.CompletableDeferred
@@ -97,7 +101,7 @@ class ReaderScreenTest {
     }
 
     private fun readySize(vm: ReaderViewModel, page: Int): IntSize? =
-        (vm.window?.wholeSlot(page) as? PageSlot.Ready)?.size
+        (vm.window?.slots?.get(UnitPart(page, Part.Whole)) as? PageSlot.Ready)?.size
 
     private fun waitReadySize(vm: ReaderViewModel, page: Int, expected: IntSize, timeout: Long = 30_000) {
         composeRule.waitUntil(timeout) { readySize(vm, page) == expected }
@@ -106,12 +110,12 @@ class ReaderScreenTest {
     private fun waitReady(vm: ReaderViewModel, page: Int): IntSize {
         val deadline = System.currentTimeMillis() + 30_000
         while (System.currentTimeMillis() < deadline) {
-            val slot = vm.window?.wholeSlot(page)
+            val slot = vm.window?.slots?.get(UnitPart(page, Part.Whole))
             if (slot is PageSlot.Ready) return slot.size
             composeRule.waitForIdle()
             Thread.sleep(25)
         }
-        val slot = vm.window?.wholeSlot(page)
+        val slot = vm.window?.slots?.get(UnitPart(page, Part.Whole))
         throw AssertionError("page $page never became Ready; slot=$slot, state=${vm.state}")
     }
 
@@ -339,7 +343,7 @@ class ReaderScreenTest {
             waitReady(vm, 0)
 
             // The corrupt page (1) is rendered as a Failed slot in the prefetch window.
-            composeRule.waitUntil(10_000) { vm.window?.wholeSlot(1) is PageSlot.Failed }
+            composeRule.waitUntil(10_000) { vm.window?.slots?.get(UnitPart(1, Part.Whole)) is PageSlot.Failed }
 
             // Navigate to it: the placeholder must be shown.
             goTo(vm, 1)
@@ -363,7 +367,7 @@ class ReaderScreenTest {
             // The size sweep fails on the header-broken page (1): no window target can be built
             // for it, so the reader must fall back to the error placeholder, not a blank box.
             composeRule.waitUntil(30_000) { vm.sizes?.failed(1) == true }
-            assertNull("a probe-failed page can never get a window slot", vm.window?.wholeSlot(1))
+            assertNull("a probe-failed page can never get a window slot", vm.window?.slots?.get(UnitPart(1, Part.Whole)))
 
             // Navigate to it: the placeholder must be shown.
             goTo(vm, 1)
@@ -420,6 +424,9 @@ class ReaderScreenTest {
         launch(Uri.fromFile(file)).use { scenario ->
             val vm = grabVm(scenario)
             awaitAttached(vm)
+            // Pin the layout this test assumes: it renders whole strip pages through the pager
+            // (auto-selection in Task 6 would otherwise resolve this book to Webtoon).
+            composeRule.runOnIdle { vm.setLayoutChoice(LayoutChoice.Single) }
             waitReady(vm, 0)
 
             // Switch to fit-width.
@@ -441,8 +448,11 @@ class ReaderScreenTest {
         launch(Uri.fromFile(file)).use { scenario ->
             val vm = grabVm(scenario)
 
-            // Wait only for attach (the render may still be in flight).
+            // Wait only for attach (the render may still be in flight). huge-single's page is
+            // wide: pin Split Off so the whole-page unit is the one being rendered (auto-selection
+            // itself arrives in Task 6).
             composeRule.waitUntil(10_000) { vm.state != null }
+            composeRule.runOnIdle { vm.setSplit(SplitChoice.Off) }
             composeRule.onNodeWithTag("reader-root").assertExists()
 
             val book = vm.book!!
@@ -492,7 +502,12 @@ class ReaderScreenTest {
             val book = NativeBook(app.engine.openPath(file.absolutePath), copiedFile = null)
             composeRule.runOnIdle { readerVm.attach(OpenResult.Opened(book, file.name)) }
             composeRule.waitUntil(60_000) { readerVm.state != null && readerVm.viewport != null }
-            composeRule.runOnIdle { readerVm.setFitMode(mode) }
+            composeRule.runOnIdle {
+                // fit-height-wide's page is wide: pin Split Off, because this test reads the
+                // whole-page unit and Auto would split it (auto-selection arrives in Task 6).
+                readerVm.setSplit(SplitChoice.Off)
+                readerVm.setFitMode(mode)
+            }
 
             // Wait for the base of the settled viewport (the immersive-bars transition resizes the
             // window shortly after composition): a stable viewport and a Ready slot of its size.
@@ -502,7 +517,7 @@ class ReaderScreenTest {
             while (System.currentTimeMillis() < deadline && ready == null) {
                 composeRule.waitForIdle()
                 val view = readerVm.viewport!!
-                val slot = readerVm.window?.wholeSlot(0) as? PageSlot.Ready
+                val slot = readerVm.window?.slots?.get(UnitPart(0, Part.Whole)) as? PageSlot.Ready
                 if (view == lastViewport && readerVm.state?.fitMode == mode && slot != null &&
                     slot.size == baseSize(w, h, view.width, view.height, mode)
                 ) {
@@ -512,7 +527,8 @@ class ReaderScreenTest {
                 if (ready == null) Thread.sleep(200)
             }
             val slot = checkNotNull(ready) {
-                "page never became Ready for $mode; viewport=$lastViewport slot=${readerVm.window?.wholeSlot(0)}"
+                "page never became Ready for $mode; viewport=$lastViewport " +
+                    "slot=${readerVm.window?.slots?.get(UnitPart(0, Part.Whole))}"
             }
             assertEquals("the fit must not be memory-capped for this test", slot.size, slot.display)
             composeRule.waitForIdle()

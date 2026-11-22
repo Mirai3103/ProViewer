@@ -19,7 +19,11 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 
-/** The reader's UI state. [page], [direction] and [fitMode] live here so they survive rotation. */
+/**
+ * The reader's UI state. [page], [direction] and [fitMode] live here so they survive rotation.
+ * [page] stays the book page; [unit] is the pager unit currently shown ([ReaderUnit], one pager
+ * page) and [layout] the resolved reading layout behind it.
+ */
 data class ReaderState(
     val title: String,
     val page: Int,
@@ -27,12 +31,18 @@ data class ReaderState(
     val direction: Direction,
     val fitMode: FitMode,
     val overlayVisible: Boolean,
+    val layoutChoice: LayoutChoice = LayoutChoice.Auto,
+    val split: SplitChoice = SplitChoice.Auto,
+    val shift: Boolean = false,
+    val layout: Layout = Layout.Single,
+    val unit: Int = 0,
 )
 
 /**
- * Owns the opened [NativeBook], its [PageRenderer] and its [PageWindow], and survives rotation.
- * It also runs the open itself ([open]) on [viewModelScope], so a copy or open in flight survives
- * rotation instead of being cancelled with the Activity.
+ * Owns the opened [NativeBook], its [PageRenderer], its [PageWindow] and the book's
+ * [ReaderUnit]s, and survives rotation. It also runs the open itself ([open]) on
+ * [viewModelScope], so a copy or open in flight survives rotation instead of being cancelled with
+ * the Activity.
  *
  * Every public method must be called on the main thread.
  *
@@ -58,7 +68,15 @@ class ReaderViewModel : ViewModel() {
     internal var sizes: PageSizes? = null
         private set
 
-    /** Re-runs [scheduleWindowUpdate] whenever [PageSizes.version] changes. */
+    /**
+     * The reader's units (one pager page each), rebuilt from the current sizes, layout, split,
+     * shift and direction. Snapshot state: the pager's page count is read from it. Rebuilt only
+     * when those inputs change (never on page turns), keeping [ReaderState.page] fixed.
+     */
+    var units: List<ReaderUnit> by mutableStateOf(emptyList())
+        private set
+
+    /** Re-runs [recomputeUnits] whenever [PageSizes.version] changes. */
     private var sizesJob: Job? = null
 
     private var viewW = 0
@@ -137,7 +155,9 @@ class ReaderViewModel : ViewModel() {
         releaseResources()
         val book = opened.book
         val renderer = PageRenderer(book, strategy)
-        val budget = ImageBudget()
+        // Bytes freed outside the window (detail images, tiles) must let budget-skipped window
+        // targets retry: every release pokes a window update.
+        val budget = ImageBudget(onReleased = { postWindowUpdate() })
         val window = PageWindow(viewModelScope, renderer, budget)
         val sizes = PageSizes(viewModelScope, renderer)
         this.book = book
@@ -145,9 +165,10 @@ class ReaderViewModel : ViewModel() {
         this.budget = budget
         this.window = window
         this.sizes = sizes
-        // Page sizes arrive in the background; every batch of them can unlock more window targets.
+        // Page sizes arrive in the background; every batch of them can change the units (split
+        // decisions, pairing) and unlock more window targets.
         sizesJob = viewModelScope.launch {
-            snapshotFlow { sizes.version }.collect { scheduleWindowUpdate() }
+            snapshotFlow { sizes.version }.collect { recomputeUnits() }
         }
         sizes.start()
         state = ReaderState(
@@ -157,42 +178,92 @@ class ReaderViewModel : ViewModel() {
             direction = Direction.Ltr,
             fitMode = FitMode.Screen,
             overlayVisible = false,
+            layout = resolvedLayout(LayoutChoice.Auto),
         )
-        scheduleWindowUpdate()
+        recomputeUnits()
     }
 
+    /**
+     * Jumps to book page [page], snapping to the first unit that contains it (the slider snaps to
+     * the first half of a split page). A no-op when the state already matches.
+     */
     fun goTo(page: Int) {
         val s = state ?: return
         val clamped = page.coerceIn(0, (s.count - 1).coerceAtLeast(0))
-        if (clamped == s.page) return
-        state = s.copy(page = clamped)
+        val unit = unitIndexOf(units, clamped).coerceAtLeast(0)
+        if (clamped == s.page && unit == s.unit) return
+        state = s.copy(page = clamped, unit = unit)
         scheduleWindowUpdate()
     }
 
     /**
-     * Called when the pager settles on a page. Only a settle after a user swipe ([fromUser])
-     * moves the reader ([goTo], a no-op when unchanged); a programmatic animation's settle only
-     * updates [settledPage], so an interrupted animation can never pull the reader back to the
-     * page it was interrupted at.
+     * Called when the pager settles on [unit]. Only a settle after a user swipe ([fromUser])
+     * moves the reader (to [unit]'s first book page); a programmatic animation's settle only
+     * updates [settledUnit], so an interrupted animation can never pull the reader back to the
+     * unit it was interrupted at.
      */
-    fun onPageSettled(page: Int, fromUser: Boolean = true) {
-        settledPage = page
-        if (fromUser) goTo(page)
+    fun onUnitSettled(unit: Int, fromUser: Boolean) {
+        settledUnit = unit
+        settledPage = units.getOrNull(unit)?.parts?.firstOrNull()?.page
+        if (!fromUser) return
+        val s = state ?: return
+        val target = units.getOrNull(unit) ?: return
+        if (unit == s.unit) return
+        state = s.copy(unit = unit, page = target.parts.first().page)
+        scheduleWindowUpdate()
     }
 
-    /** The page the pager last settled on; a test seam to await an animation's end. */
+    /** The unit the pager last settled on; a test seam to await an animation's end. */
+    internal var settledUnit: Int? = null
+        private set
+
+    /** The first book page of the settled unit (equal to it in Single without split). */
     internal var settledPage: Int? = null
         private set
 
-    fun next() = state?.let { goTo(it.page + 1) }
+    /** Turns to the next unit; a no-op on the last one. */
+    fun next() = moveUnit(+1)
 
-    fun previous() = state?.let { goTo(it.page - 1) }
+    /** Turns to the previous unit; a no-op on the first one. */
+    fun previous() = moveUnit(-1)
+
+    private fun moveUnit(delta: Int) {
+        val s = state ?: return
+        val target = s.unit + delta
+        val targetUnit = units.getOrNull(target) ?: return
+        state = s.copy(unit = target, page = targetUnit.parts.first().page)
+        scheduleWindowUpdate()
+    }
+
+    /** Sets the layout choice and rebuilds the units, keeping the book page. */
+    fun setLayoutChoice(c: LayoutChoice) {
+        val s = state ?: return
+        if (s.layoutChoice == c) return
+        state = s.copy(layoutChoice = c, layout = resolvedLayout(c))
+        recomputeUnits()
+    }
+
+    /** Sets the split choice (Single only) and rebuilds the units, keeping the book page. */
+    fun setSplit(c: SplitChoice) {
+        val s = state ?: return
+        if (s.split == c) return
+        state = s.copy(split = c)
+        recomputeUnits()
+    }
+
+    /** Sets the two-page shift (the opening pair only) and rebuilds the units, keeping the book page. */
+    fun setShift(on: Boolean) {
+        val s = state ?: return
+        if (s.shift == on) return
+        state = s.copy(shift = on)
+        recomputeUnits()
+    }
 
     fun setDirection(d: Direction) {
         val s = state ?: return
         if (s.direction == d) return
         state = s.copy(direction = d)
-        scheduleWindowUpdate()
+        recomputeUnits()
     }
 
     fun setFitMode(m: FitMode) {
@@ -227,6 +298,45 @@ class ReaderViewModel : ViewModel() {
     }
 
     /**
+     * The layout for a layout choice. Auto resolves to Single until Task 6 adds strip detection
+     * ([resolveLayout] with a real `isStrip`) and the orientation re-resolution in [onViewport].
+     */
+    private fun resolvedLayout(choice: LayoutChoice): Layout = when (choice) {
+        LayoutChoice.Auto, LayoutChoice.Single -> Layout.Single
+        LayoutChoice.TwoPage -> Layout.TwoPage
+        LayoutChoice.Webtoon -> Layout.Webtoon
+    }
+
+    /**
+     * Rebuilds [units] from the current state, keeping the reader on the same book page (its
+     * first unit). Called when the sizes version, layout choice, split, shift or direction
+     * changes — never on page turns, so `buildUnits` (O(pages)) does not run per update.
+     */
+    private fun recomputeUnits() {
+        val s = state ?: run {
+            units = emptyList()
+            return
+        }
+        val built = buildUnits(s.count, pageSizeLookup(), s.layout, s.split, s.direction, s.shift)
+        val unit = unitIndexOf(built, s.page).coerceAtLeast(0)
+        if (built != units) units = built
+        if (unit != s.unit) state = s.copy(unit = unit)
+        scheduleWindowUpdate()
+    }
+
+    /** Combines the prober's landed sizes with the renderer's cached page info. */
+    private fun pageSizeLookup(): (Int) -> IntSize? {
+        val sizes = this.sizes
+        val renderer = this.renderer
+        return { page -> sizes?.known(page) ?: renderer?.knownPageSize(page) }
+    }
+
+    /** [scheduleWindowUpdate] from any thread: budget releases happen on render threads. */
+    private fun postWindowUpdate() {
+        viewModelScope.launch(Dispatchers.Main) { scheduleWindowUpdate() }
+    }
+
+    /**
      * Reconciles the window to the current state. At most one update is ever queued: rapid page
      * jumps (mashing volume keys, dragging the slider) coalesce into the latest state instead of
      * queueing a render per page passed. The coroutine runs on the main dispatcher (deferred, not
@@ -239,19 +349,28 @@ class ReaderViewModel : ViewModel() {
         viewModelScope.launch(Dispatchers.Main) {
             updatePending = false
             val s = state ?: return@launch
+            // A closed book (release, or a close that raced a scheduled update) can serve neither
+            // new targets nor a prefetch hint; its slots already carry the failure.
+            if (book?.isClosed == true) return@launch
             val w = viewW
             val h = viewH
             if (w <= 0 || h <= 0) return@launch
             val window = window ?: return@launch
-            val renderer = renderer ?: return@launch
             val sizes = sizes ?: return@launch
+            val currentUnits = units
+            if (currentUnits.isEmpty()) return@launch
+            val unit = s.unit.coerceIn(0, currentUnits.size - 1)
             val forward = s.direction == Direction.Ltr
-            // Temporary one-page-per-unit driving of the part-keyed window (the unit pager is Task 5).
-            val sizeOf = { page: Int -> sizes.known(page) ?: renderer.knownPageSize(page) }
-            sizes.prioritize(windowPages(s.page, s.count, WINDOW_AHEAD, WINDOW_BEHIND, forward))
-            val units = buildUnits(s.count, sizeOf, Layout.Single, SplitChoice.Off, s.direction, shift = false)
-            val targets = windowTargets(units, s.page, WINDOW_AHEAD, WINDOW_BEHIND, forward) { unit ->
-                unitGeometry(unit, sizeOf, w, h, s.fitMode, s.direction)
+            val sizeOf = pageSizeLookup()
+            // The window's pages (the parts of the current unit and its neighbours), prioritized
+            // so the prober lands them before the rest of the book.
+            sizes.prioritize(
+                windowPages(unit, currentUnits.size, WINDOW_AHEAD, WINDOW_BEHIND, forward)
+                    .flatMap { u -> currentUnits[u].parts.map { it.page } }
+                    .distinct(),
+            )
+            val targets = windowTargets(currentUnits, unit, WINDOW_AHEAD, WINDOW_BEHIND, forward) { target ->
+                unitGeometry(target, sizeOf, w, h, s.fitMode, s.direction)
             }
             window.update(targets, PrefetchRequest(s.page, forward, w, h, s.fitMode))
         }
@@ -276,6 +395,6 @@ class ReaderViewModel : ViewModel() {
     }
 }
 
-/** Pages kept rendered ahead of / behind the current one. */
+/** Units kept rendered ahead of / behind the current one. */
 private const val WINDOW_AHEAD = 3
 private const val WINDOW_BEHIND = 1

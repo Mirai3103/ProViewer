@@ -46,6 +46,9 @@ class NativeBook(
     private val infoCache = ConcurrentHashMap<Int, PageInfo>()
     private val closed = AtomicBoolean(false)
 
+    /** True once [close] has run (or started): every further native call would fail. */
+    val isClosed: Boolean get() = closed.get()
+
     /**
      * Page size and format, probed once per page and memoized. The probe may read and inflate the
      * whole entry, so call it off the main thread unless [cachedPageInfo] already has the page. No
