@@ -225,13 +225,21 @@ fun WebtoonViewport(
         animJob.value = null
     }
 
-    /** Starts a spline decay from the current scroll with [velocityY] (screen px/s). */
+    /**
+     * Starts a spline decay continuing a drag released with the finger velocity [velocityY]
+     * (screen px/s, positive = the finger moved down): the content follows the finger, so a
+     * positive release flings toward the column's top (scrollY decreases). The same convention
+     * serves the gesture's velocity tracker and [WebtoonAutomation.fling] (whose contract is
+     * "positive scrolls up").
+     */
     fun startFling(velocityY: Float) {
         cancelAnim()
         animJob.value = scope.launch {
             animateDecay(
                 initialValue = session.scrollY.toFloat(),
-                initialVelocity = velocityY / session.zoom,
+                // animateDecay grows the value with a positive velocity, while the drag grows
+                // scrollY with a negative finger velocity: negate to continue the drag.
+                initialVelocity = -velocityY / session.zoom,
                 animationSpec = decay,
             ) { value, _ ->
                 session.scrollY = value.toDouble()

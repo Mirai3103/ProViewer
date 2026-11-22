@@ -617,6 +617,37 @@ class WebtoonTest {
     }
 
     @Test
+    fun fling_direction_matches_documented_contract() {
+        val readerVm = launchReader(corpusFile("webtoon-long.cbz"), RecordingProbe())
+        awaitWebtoon(readerVm)
+        awaitTileReady(readerVm, page = 0)
+        val session = checkNotNull(readerVm.webtoon)
+        val auto = webtoonAutomation()
+
+        // Start mid-book, with room to fling in both directions.
+        scrollTo(readerVm, auto.maxScroll / 2)
+
+        // fling(+velocity) is the release of a downward swipe: the content follows the finger's
+        // momentum, so the viewport scrolls UP (scrollY decreases) — the documented contract.
+        val before = session.scrollY
+        mainScope.launch { auto.fling(4000f) }
+        composeRule.waitUntil(15_000) { session.scrollY <= before - 50.0 }
+        val afterUpFling = session.scrollY
+        assertTrue(
+            "fling(+4000) must scroll up: before=$before after=$afterUpFling",
+            afterUpFling < before - 50.0,
+        )
+
+        // fling(-velocity) scrolls DOWN (scrollY increases).
+        mainScope.launch { auto.fling(-4000f) }
+        composeRule.waitUntil(15_000) { session.scrollY >= afterUpFling + 50.0 }
+        assertTrue(
+            "fling(-4000) must scroll down: afterUpFling=$afterUpFling after=${session.scrollY}",
+            session.scrollY > afterUpFling + 50.0,
+        )
+    }
+
+    @Test
     fun slider_far_jump_lands_on_page_top() {
         // The counting wrapper resolves the VM's renderer lazily and is installed before attach,
         // so it is in the render path however the session is created.
