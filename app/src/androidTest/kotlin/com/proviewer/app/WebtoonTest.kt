@@ -1027,6 +1027,50 @@ class WebtoonTest {
     }
 
     @Test
+    fun pinch_finger_swap_does_not_snap_zoom() {
+        val readerVm = launchReader(corpusFile("webtoon-long.cbz"), RecordingProbe())
+        awaitWebtoon(readerVm)
+        val session = checkNotNull(readerVm.webtoon)
+        awaitTileReady(readerVm, page = 0)
+        val cx = readerVm.viewport!!.width / 2f
+        val cy = readerVm.viewport!!.height / 2f
+
+        // One gesture: spread a 400 px pair to 600 px (zoom -> 1.5), then a grip change — lift
+        // the right finger, drag the left one (latched: no zoom, no scroll), land a new finger
+        // 200 px from it and move it to 240 px. The zoom must follow the NEW pair's ratio
+        // (1.5 x 240/200 = 1.8); ratioing against the old pair's stale 600 px span would snap it
+        // to the 1x clamp first (1.5 x 200/600 = 0.5) and recover only to 1.2.
+        composeRule.onNodeWithTag("webtoon-viewport").performTouchInput {
+            down(pointerId = 0, position = Offset(cx - 200f, cy))
+            down(pointerId = 1, position = Offset(cx + 200f, cy))
+            repeat(4) { moveTo(pointerId = 1, position = Offset(cx + 250f + 50f * it, cy)) }
+            up(pointerId = 1)
+            moveTo(pointerId = 0, position = Offset(cx - 200f, cy - 50f))
+            down(pointerId = 1, position = Offset(cx, cy - 50f))
+            moveTo(pointerId = 1, position = Offset(cx + 40f, cy - 50f))
+            up(pointerId = 0)
+            up(pointerId = 1)
+        }
+        composeRule.waitForIdle()
+
+        assertEquals("a finger swapped in must re-baseline, not snap", 1.8f, session.zoom, 0.05f)
+        val maxPan = session.layout.viewW * (session.zoom - 1f)
+        assertTrue("pan must stay in bounds", session.panX in 0f..maxPan)
+        assertTrue(
+            "scroll must stay in bounds",
+            session.scrollY in 0.0..session.layout.maxScroll(session.zoom),
+        )
+
+        // The latched release never flings: the scroll is exactly where the gesture left it.
+        composeRule.waitForIdle()
+        val afterGesture = session.scrollY
+        Thread.sleep(300)
+        composeRule.waitForIdle()
+        assertEquals("a pinch release must not fling", afterGesture, session.scrollY, 0.5)
+        assertNoScopeErrors()
+    }
+
+    @Test
     fun zoomed_scroll_under_cap() {
         val readerVm = launchReader(corpusFile("webtoon-long.cbz"), RecordingProbe())
         awaitWebtoon(readerVm)

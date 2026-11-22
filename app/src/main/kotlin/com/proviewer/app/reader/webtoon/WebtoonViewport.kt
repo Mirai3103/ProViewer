@@ -525,7 +525,17 @@ fun WebtoonViewport(
                     cancelAnim()
                     val tracker = VelocityTracker()
                     tracker.addPosition(down.uptimeMillis, down.position)
-                    var pinch: PinchGesture? = null
+                    // The pinch keeps two separate pieces of state: the latch (this gesture is a
+                    // pinch — it never drag-scrolls and never flings on release, and a finger
+                    // left behind does nothing) and the ratio basis (the last good two-finger
+                    // span and the zoom it mapped to). The basis is dropped whenever fewer than
+                    // two fingers are pressed, so a finger swapped in mid-gesture (2->1->2 grip
+                    // change) re-baselines against the CURRENT zoom and its own first span
+                    // instead of ratioing against the old pair's stale span — which would snap
+                    // the zoom by the span ratio in one event. A degenerate span (fingers on the
+                    // same spot) never becomes the basis: the last good one stays.
+                    var pinchLatched = false
+                    var basis: PinchBasis? = null
                     while (true) {
                         val event = awaitPointerEvent()
                         val changes = event.changes
@@ -539,49 +549,45 @@ fun WebtoonViewport(
                         if (pressed.size >= 2) {
                             // Pinch: zoom about the fingers' centroid within [1, WEBTOON_MAX_ZOOM],
                             // keeping the focal content point under the centroid (scrollY and panX
-                            // adjusted about it). A pinch never scrolls the list by itself: the
-                            // gesture latches until all fingers are up — no drag scroll and no
-                            // release fling, and a finger left behind does nothing.
+                            // adjusted about it).
                             changes.forEach { change -> if (change.pressed) change.consume() }
                             val a = pressed[0].position
                             val b = pressed[1].position
                             val span = (a - b).getDistance()
                             val centroid = Offset((a.x + b.x) / 2f, (a.y + b.y) / 2f)
-                            val prev = pinch
-                            var applied = false
-                            if (prev != null && prev.span > 0.5f && span > 0.5f) {
-                                val zoom = (prev.zoom * span / prev.span)
-                                    .coerceIn(1f, WEBTOON_MAX_ZOOM)
-                                val contentX = (centroid.x + session.panX) / session.zoom
-                                val contentY = centroid.y / session.zoom + session.scrollY
-                                session.zoom = zoom
-                                val maxPan = session.layout.viewW * (zoom - 1f)
-                                session.panX = (contentX * zoom - centroid.x).coerceIn(0f, maxPan)
-                                session.scrollY = (contentY - centroid.y / zoom)
-                                    .coerceIn(0.0, session.layout.maxScroll(zoom))
-                                applied = true
+                            val prev = basis
+                            if (prev != null && span > 0.5f) {
+                                applyZoom(
+                                    (prev.zoom * span / prev.span).coerceIn(1f, WEBTOON_MAX_ZOOM),
+                                    centroid,
+                                    (centroid.x + session.panX) / session.zoom,
+                                    centroid.y / session.zoom + session.scrollY,
+                                )
                             }
-                            pinch = PinchGesture(
-                                span,
-                                if (applied) session.zoom else (prev?.zoom ?: session.zoom),
-                            )
-                        } else if (pressed.size == 1) {
-                            val change = pressed[0]
-                            val drag = change.positionChange()
-                            if (drag != Offset.Zero) {
-                                change.consume()
-                                if (pinch == null) {
-                                    // Drag scrolls 1:1 (divided by the zoom); horizontal drags pan
-                                    // while zoomed (the pan range collapses to zero at 1x).
-                                    session.scrollY = (session.scrollY - drag.y / session.zoom)
-                                        .coerceIn(0.0, session.layout.maxScroll(session.zoom))
-                                    val maxPan = session.layout.viewW * (session.zoom - 1f)
-                                    session.panX = (session.panX - drag.x).coerceIn(0f, maxPan)
+                            if (span > 0.5f) basis = PinchBasis(span, session.zoom)
+                            pinchLatched = true
+                        } else {
+                            // Fewer than two fingers: the pair's span is stale, so the next pair
+                            // re-baselines; the latch stays until all fingers are up.
+                            basis = null
+                            if (pressed.size == 1) {
+                                val change = pressed[0]
+                                val drag = change.positionChange()
+                                if (drag != Offset.Zero) {
+                                    change.consume()
+                                    if (!pinchLatched) {
+                                        // Drag scrolls 1:1 (divided by the zoom); horizontal drags
+                                        // pan while zoomed (the pan range collapses to zero at 1x).
+                                        session.scrollY = (session.scrollY - drag.y / session.zoom)
+                                            .coerceIn(0.0, session.layout.maxScroll(session.zoom))
+                                        val maxPan = session.layout.viewW * (session.zoom - 1f)
+                                        session.panX = (session.panX - drag.x).coerceIn(0f, maxPan)
+                                    }
                                 }
                             }
                         }
                         if (pressed.isEmpty()) {
-                            if (pinch == null) {
+                            if (!pinchLatched) {
                                 val velocity = tracker.calculateVelocity()
                                 if (abs(velocity.y) > MIN_FLING_VELOCITY) startFling(velocity.y)
                             }
@@ -620,8 +626,8 @@ fun WebtoonViewport(
 /** Inputs a layout rebuild depends on; a change re-runs the rebuild. */
 private data class RebuildKey(val size: IntSize, val sizesVersion: Int, val failedCount: Int)
 
-/** A pinch's previous two-finger span and the zoom it mapped to (the next event's ratio basis). */
-private class PinchGesture(val span: Float, val zoom: Float)
+/** A pinch's last good two-finger span and the zoom it mapped to (the next event's ratio basis). */
+private class PinchBasis(val span: Float, val zoom: Float)
 
 /**
  * The draw-phase body: failed pages' error placeholders first, then the dark under-layer for
