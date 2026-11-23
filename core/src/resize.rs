@@ -242,6 +242,92 @@ where
     Ok(())
 }
 
+/// Upper bound on either dimension of the virtual full-page size of [`render_scaled_region`] (2^20). It keeps
+/// every `coordinate * page dimension` product exact in `f64` and the scale far from degenerate.
+pub const MAX_SCALED_FULL_DIM: u32 = 1 << 20;
+
+/// A crop in **page** coordinates with sub-pixel precision.
+#[derive(Clone, Copy, Debug)]
+struct PageCrop {
+    left: f64,
+    top: f64,
+    width: f64,
+    height: f64,
+}
+
+impl PageCrop {
+    fn of_rect(region: Rect) -> Self {
+        PageCrop {
+            left: region.x as f64,
+            top: region.y as f64,
+            width: region.width as f64,
+            height: region.height as f64,
+        }
+    }
+}
+
+/// Checks that `dst` holds `out_h` rows of `out_w * 4` bytes, `dst_stride` bytes apart. Returns the row size.
+fn validate_dst(out_w: u32, out_h: u32, dst_len: usize, dst_stride: usize) -> Result<usize> {
+    if out_w == 0 || out_h == 0 {
+        return Err(invalid("output size must be non-zero"));
+    }
+    let row_bytes = (out_w as usize)
+        .checked_mul(4)
+        .ok_or_else(|| invalid("output row size overflows"))?;
+    if dst_stride < row_bytes {
+        return Err(invalid("dst_stride is smaller than out_w * 4"));
+    }
+    let needed = dst_stride
+        .checked_mul(out_h as usize - 1)
+        .and_then(|n| n.checked_add(row_bytes))
+        .ok_or_else(|| invalid("output buffer size overflows"))?;
+    if dst_len < needed {
+        return Err(invalid("dst is too small for the requested output"));
+    }
+    Ok(row_bytes)
+}
+
+/// Checks that `region` is non-empty and inside a `page_w x page_h` page, without overflowing.
+fn validate_region(region: Rect, page_w: u32, page_h: u32) -> Result<()> {
+    if region.width == 0 || region.height == 0 {
+        return Err(invalid("region is empty"));
+    }
+    let right = region.x.checked_add(region.width);
+    let bottom = region.y.checked_add(region.height);
+    if right.is_none_or(|r| r > page_w) || bottom.is_none_or(|b| b > page_h) {
+        return Err(invalid("region is outside the page"));
+    }
+    Ok(())
+}
+
+/// Checks a scaled-tile request: `full_w x full_h` in `1..=MAX_SCALED_FULL_DIM` and the output rectangle
+/// `(out_x, out_y, out_w, out_h)` non-empty and inside it, without overflowing. Shared with the engine, which
+/// runs it before decoding.
+pub(crate) fn validate_scaled_rect(
+    full_w: u32,
+    full_h: u32,
+    out_x: u32,
+    out_y: u32,
+    out_w: u32,
+    out_h: u32,
+) -> Result<()> {
+    let dims = 1..=MAX_SCALED_FULL_DIM;
+    if !dims.contains(&full_w) || !dims.contains(&full_h) {
+        return Err(invalid(format!(
+            "full size must be 1..={MAX_SCALED_FULL_DIM} in each dimension"
+        )));
+    }
+    if out_w == 0 || out_h == 0 {
+        return Err(invalid("output size must be non-zero"));
+    }
+    let right = out_x.checked_add(out_w);
+    let bottom = out_y.checked_add(out_h);
+    if right.is_none_or(|r| r > full_w) || bottom.is_none_or(|b| b > full_h) {
+        return Err(invalid("output rectangle is outside the full size"));
+    }
+    Ok(())
+}
+
 /// Render `region` (page coordinates) of `src` into `out_w x out_h` RGBA8888 rows of `dst`.
 ///
 /// `src` may be a decimated decode (`src.denom > 1`): it is smaller than the page, so the region is scaled by
@@ -257,11 +343,12 @@ pub fn render_region(
     dst: &mut [u8],
     dst_stride: usize,
 ) -> Result<()> {
+    validate_region(region, page_w, page_h)?;
     render_region_with_budget(
         src,
         page_w,
         page_h,
-        region,
+        PageCrop::of_rect(region),
         out_w,
         out_h,
         dst,
@@ -270,12 +357,61 @@ pub fn render_region(
     )
 }
 
+/// Render the `out_w x out_h` rectangle at `(out_x, out_y)` of a virtual `full_w x full_h` render of the whole
+/// page into `dst` (RGBA8888 rows `dst_stride` bytes apart; padding untouched).
+///
+/// The rectangle maps to the page crop `out_x * page_w / full_w` (and likewise for every edge), so tiles of the
+/// same full size share one page <-> output mapping: their pixels are the matching rows and columns of a
+/// one-shot render of the whole page at `full_w x full_h` within 1 channel level, with no gap, overlap or
+/// row/column jump at a seam. (Not byte-exact: the resizer's coefficients for a tile come from differently
+/// rounded f64 values, which can flip an isolated value by 1.)
+#[allow(clippy::too_many_arguments)]
+pub fn render_scaled_region(
+    src: &DecodedImage,
+    page_w: u32,
+    page_h: u32,
+    full_w: u32,
+    full_h: u32,
+    out_x: u32,
+    out_y: u32,
+    out_w: u32,
+    out_h: u32,
+    dst: &mut [u8],
+    dst_stride: usize,
+) -> Result<()> {
+    validate_scaled_rect(full_w, full_h, out_x, out_y, out_w, out_h)?;
+    if page_w == 0 || page_h == 0 {
+        return Err(invalid("page and source sizes must be non-zero"));
+    }
+    // Every product is below 2^20 * 2^32 < 2^53, so it is exact and each edge is one correctly rounded division.
+    let to_page = |out: u32, page: u32, full: u32| out as f64 * page as f64 / full as f64;
+    let crop = PageCrop {
+        left: to_page(out_x, page_w, full_w),
+        top: to_page(out_y, page_h, full_h),
+        width: to_page(out_w, page_w, full_w),
+        height: to_page(out_h, page_h, full_h),
+    };
+    render_region_with_budget(
+        src,
+        page_w,
+        page_h,
+        crop,
+        out_w,
+        out_h,
+        dst,
+        dst_stride,
+        BAND_BUDGET_BYTES,
+    )
+}
+
+/// Render the page-space `crop` of `src` into `out_w x out_h` RGBA8888 rows of `dst`. The crop must lie inside
+/// the page (callers validate it in their own integer coordinates first).
 #[allow(clippy::too_many_arguments)]
 fn render_region_with_budget(
     src: &DecodedImage,
     page_w: u32,
     page_h: u32,
-    region: Rect,
+    crop: PageCrop,
     out_w: u32,
     out_h: u32,
     dst: &mut [u8],
@@ -283,32 +419,18 @@ fn render_region_with_budget(
     budget: usize,
 ) -> Result<()> {
     // ---- validate everything before allocating ----
-    if out_w == 0 || out_h == 0 {
-        return Err(invalid("output size must be non-zero"));
-    }
-    let row_bytes = (out_w as usize)
-        .checked_mul(4)
-        .ok_or_else(|| invalid("output row size overflows"))?;
-    if dst_stride < row_bytes {
-        return Err(invalid("dst_stride is smaller than out_w * 4"));
-    }
-    let needed = dst_stride
-        .checked_mul(out_h as usize - 1)
-        .and_then(|n| n.checked_add(row_bytes))
-        .ok_or_else(|| invalid("output buffer size overflows"))?;
-    if dst.len() < needed {
-        return Err(invalid("dst is too small for the requested output"));
-    }
+    let row_bytes = validate_dst(out_w, out_h, dst.len(), dst_stride)?;
     if page_w == 0 || page_h == 0 || src.width == 0 || src.height == 0 {
         return Err(invalid("page and source sizes must be non-zero"));
     }
-    if region.width == 0 || region.height == 0 {
-        return Err(invalid("region is empty"));
+    let finite = [crop.left, crop.top, crop.width, crop.height]
+        .iter()
+        .all(|v| v.is_finite());
+    if !finite || crop.left < 0.0 || crop.top < 0.0 || crop.width <= 0.0 || crop.height <= 0.0 {
+        return Err(invalid("crop is empty or not finite"));
     }
-    let right = region.x.checked_add(region.width);
-    let bottom = region.y.checked_add(region.height);
-    if right.is_none_or(|r| r > page_w) || bottom.is_none_or(|b| b > page_h) {
-        return Err(invalid("region is outside the page"));
+    if crop.left >= page_w as f64 || crop.top >= page_h as f64 {
+        return Err(invalid("crop is outside the page"));
     }
     let channels = src.layout.channels() as usize;
     let src_row = (src.width as usize)
@@ -324,8 +446,10 @@ fn render_region_with_budget(
     }
 
     // ---- identity: whole page at source size, no resampling ----
-    let whole_page =
-        region.x == 0 && region.y == 0 && region.width == page_w && region.height == page_h;
+    let whole_page = crop.left == 0.0
+        && crop.top == 0.0
+        && crop.width == page_w as f64
+        && crop.height == page_h as f64;
     if whole_page && out_w == src.width && out_h == src.height {
         for (y, row) in dst.chunks_mut(dst_stride).take(out_h as usize).enumerate() {
             let s = &src.pixels[y * src_row..(y + 1) * src_row];
@@ -337,10 +461,10 @@ fn render_region_with_budget(
     // ---- crop in source coordinates (sub-pixel) ----
     let sx = src.width as f64 / page_w as f64;
     let sy = src.height as f64 / page_h as f64;
-    let left = region.x as f64 * sx;
-    let top = region.y as f64 * sy;
-    let crop_w = (region.width as f64 * sx).min(src.width as f64 - left);
-    let crop_h = (region.height as f64 * sy).min(src.height as f64 - top);
+    let left = crop.left * sx;
+    let top = crop.top * sy;
+    let crop_w = (crop.width * sx).min(src.width as f64 - left);
+    let crop_h = (crop.height * sy).min(src.height as f64 - top);
     // Source columns to keep: the crop plus the Lanczos margin on each side (clamped to the source), so edge
     // output pixels see the real neighbours and adjacent regions agree at their seam.
     let margin_x = band_margin(crop_w / out_w as f64);
@@ -854,7 +978,7 @@ mod tests {
             src,
             src.width,
             src.height,
-            region,
+            PageCrop::of_rect(region),
             out_w,
             out_h,
             &mut dst,
@@ -904,6 +1028,106 @@ mod tests {
                 3
             );
         }
+    }
+
+    /// `out_w x out_h` tile at `(x, y)` of `src` scaled (as a whole page) to `full_w x full_h`.
+    fn render_scaled(
+        src: &DecodedImage,
+        full_w: u32,
+        full_h: u32,
+        (x, y, w, h): (u32, u32, u32, u32),
+    ) -> Vec<u8> {
+        let mut dst = vec![0u8; (w * h * 4) as usize];
+        render_scaled_region(
+            src,
+            src.width,
+            src.height,
+            full_w,
+            full_h,
+            x,
+            y,
+            w,
+            h,
+            &mut dst,
+            (w * 4) as usize,
+        )
+        .unwrap();
+        dst
+    }
+
+    /// Rows `y..y+h`, columns `x..x+w` of a tightly packed `full_w`-wide RGBA buffer.
+    fn sub_rect(full: &[u8], full_w: u32, (x, y, w, h): (u32, u32, u32, u32)) -> Vec<u8> {
+        let stride = full_w as usize * 4;
+        let mut out = Vec::with_capacity((w * h * 4) as usize);
+        for row in y as usize..(y + h) as usize {
+            let start = row * stride + x as usize * 4;
+            out.extend_from_slice(&full[start..start + w as usize * 4]);
+        }
+        out
+    }
+
+    /// Tiles every `tile_w x tile_h` cell of a `full_w x full_h` scaled render and checks each one equals
+    /// the matching rows/cols of the one-shot render within 1 channel level (the f64 crop arithmetic of a
+    /// tile and of the one-shot render round differently, which flips an isolated value by 1 at most). A
+    /// row or column shift would differ by far more on this noise image.
+    fn check_scaled_tiles(
+        src: &DecodedImage,
+        full_w: u32,
+        full_h: u32,
+        tile_w: u32,
+        tile_h: u32,
+        what: &str,
+    ) {
+        let whole = render_scaled(src, full_w, full_h, (0, 0, full_w, full_h));
+        let mut differing = 0;
+        for y in (0..full_h).step_by(tile_h as usize) {
+            for x in (0..full_w).step_by(tile_w as usize) {
+                let rect = (x, y, tile_w.min(full_w - x), tile_h.min(full_h - y));
+                let tile = render_scaled(src, full_w, full_h, rect);
+                let expected = sub_rect(&whole, full_w, rect);
+                assert_close(&tile, &expected, &format!("{what} tile {rect:?}"));
+                differing += tile.iter().zip(&expected).filter(|(a, b)| a != b).count();
+            }
+        }
+        println!("{what}: {differing} channel values differ (by 1) from the one-shot render");
+    }
+
+    #[test]
+    fn scaled_bands_match_full_render() {
+        for (name, src) in [("gray", noise_gray(80, 2400)), ("rgb", noise_rgb(80, 2400))] {
+            // 1000/1000/1000/240-row bands of a 108x3240 render (1.35x).
+            check_scaled_tiles(&src, 108, 3240, 108, 1000, &format!("{name} bands"));
+            // 2-D: 100x1000 tiles of a 216x6480 render (2.7x).
+            check_scaled_tiles(&src, 216, 6480, 100, 1000, &format!("{name} 2-D tiles"));
+        }
+    }
+
+    #[test]
+    fn render_scaled_region_rejects_bad_requests() {
+        let src = gray(8, 8, |_, _| 1);
+        let mut dst = vec![0u8; 16 * 16 * 4];
+        let mut call = |full_w: u32, full_h: u32, x: u32, y: u32, w: u32, h: u32| {
+            let r = render_scaled_region(&src, 8, 8, full_w, full_h, x, y, w, h, &mut dst, 64);
+            assert!(
+                matches!(r, Err(EngineError::InvalidRequest { .. })),
+                "full {full_w}x{full_h}, rect ({x},{y},{w},{h}): {r:?}"
+            );
+        };
+        // out rect outside the full size
+        call(16, 16, 8, 0, 9, 4);
+        call(16, 16, 0, 13, 4, 4);
+        call(16, 16, u32::MAX, 0, 2, 2);
+        call(16, 16, 0, 16, 1, 1);
+        // zero sizes
+        call(16, 16, 0, 0, 0, 4);
+        call(16, 16, 0, 0, 4, 0);
+        call(0, 16, 0, 0, 1, 1);
+        call(16, 0, 0, 0, 1, 1);
+        // full size above the cap
+        call(MAX_SCALED_FULL_DIM + 1, 16, 0, 0, 4, 4);
+        call(16, MAX_SCALED_FULL_DIM + 1, 0, 0, 4, 4);
+        // a valid request still succeeds
+        render_scaled_region(&src, 8, 8, 16, 16, 4, 4, 8, 8, &mut dst, 64).unwrap();
     }
 
     #[test]

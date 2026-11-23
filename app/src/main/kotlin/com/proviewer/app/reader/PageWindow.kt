@@ -2,17 +2,20 @@ package com.proviewer.app.reader
 
 import androidx.compose.runtime.snapshots.SnapshotStateMap
 import androidx.compose.runtime.mutableStateMapOf
+import androidx.compose.ui.unit.IntRect
 import androidx.compose.ui.unit.IntSize
 import com.proviewer.app.engine.NativeRenderException
 import com.proviewer.app.engine.PageImage
 import com.proviewer.app.engine.PageSourceRenderer
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 
-/** The render state of a page in the window. */
+/** The render state of a part in the window. */
 sealed interface PageSlot {
     object Loading : PageSlot
     /**
@@ -23,81 +26,109 @@ sealed interface PageSlot {
     data class Failed(val reason: String) : PageSlot
 }
 
+/** What the engine is told to warm up alongside a window update (see [PageSourceRenderer.prefetchHint]). */
+data class PrefetchRequest(
+    val page: Int,
+    val forward: Boolean,
+    val viewW: Int,
+    val viewH: Int,
+    val mode: FitMode,
+)
+
 /**
- * Keeps the current page plus [ahead] ahead and [behind] behind rendered at the fit size for the
- * current viewport and mode. Runs all render work on the injected [scope]'s dispatcher (never a
+ * Keeps the given [PartTarget]s rendered: one base bitmap per [UnitPart], the part's `src` region
+ * rendered at its `base` size. Runs all render work on the injected [scope]'s dispatcher (never a
  * hidden global dispatcher), so JVM tests can drive it with a `StandardTestDispatcher`.
  *
- * [update] never blocks on a page-size probe: a page whose natural size is not known yet is probed
- * inside its render job (the renderer probes off the caller's thread).
+ * Every render's bytes (`rgbaBytes(base)`) are reserved from [budget] before the render starts
+ * (before anything is allocated) and returned when the image is released, so the bases held here
+ * never push the budget past its cap. [update] never blocks: sizes come from the targets, so it
+ * never probes a page.
  */
 class PageWindow(
     private val scope: CoroutineScope,
     private val renderer: PageSourceRenderer,
-    private val ahead: Int = 3,
-    private val behind: Int = 1,
+    private val budget: ImageBudget,
 ) {
-    val pages: SnapshotStateMap<Int, PageSlot> = mutableStateMapOf()
+    val slots: SnapshotStateMap<UnitPart, PageSlot> = mutableStateMapOf()
 
-    /** What a render is for: the inputs [baseSize] is computed from, besides the page itself. */
-    private data class Spec(val viewW: Int, val viewH: Int, val mode: FitMode)
+    /** What a slot's render is for: the part of the page, its bitmap size and its laid-out size. */
+    private data class Spec(val src: IntRect, val base: IntSize, val display: IntSize)
 
-    private data class Running(val job: Job, val spec: Spec)
+    private class Running(val spec: Spec, val bytes: Long) {
+        lateinit var job: Job
 
-    private val running = ConcurrentHashMap<Int, Running>()
+        /** [PENDING] until the job body starts; [CANCELLED_EARLY] if it was cancelled before that. */
+        val state = AtomicInteger(PENDING)
+    }
+
+    private val running = ConcurrentHashMap<UnitPart, Running>()
+
+    /** The spec each Ready slot was rendered for. */
+    private val readySpecs = ConcurrentHashMap<UnitPart, Spec>()
+
     @Volatile private var currentPage = -1
     @Volatile private var closed = false
 
     /**
-     * Reconciles the window to the given view. Evicts pages outside the window (releasing their
-     * images), cancels jobs sized for another viewport or mode, starts missing renders in
-     * `windowPages` priority order, and calls `prefetchHint` once.
+     * Reconciles the window to [targets] (in priority order, current unit first). Evicts parts
+     * outside the targets (releasing their images and bytes), cancels renders made for another spec,
+     * starts missing renders in priority order, and calls `prefetchHint` once.
+     *
+     * A render starts only after its bytes are reserved. When a reservation fails, that target and
+     * every lower-priority target are skipped for this update; they are retried by the next one.
      */
-    fun update(current: Int, forward: Boolean, viewW: Int, viewH: Int, mode: FitMode) {
+    fun update(targets: List<PartTarget>, prefetch: PrefetchRequest) {
         if (closed) return
-        currentPage = current
-        val target = windowPages(current, renderer.pageCount, ahead, behind, forward)
-        val targetSet = target.toHashSet()
-        val spec = Spec(viewW, viewH, mode)
+        currentPage = prefetch.page
+        val targetParts = targets.mapTo(HashSet()) { it.part }
 
-        // Evict pages that left the window.
-        for (p in pages.keys.toList()) {
-            if (p !in targetSet) {
-                running.remove(p)?.job?.cancel()
-                (pages.remove(p) as? PageSlot.Ready)?.image?.release()
+        // Evict parts that left the window.
+        for (part in slots.keys.toList()) {
+            if (part !in targetParts) {
+                cancel(part)
+                readySpecs.remove(part)
+                (slots.remove(part) as? PageSlot.Ready)?.image?.release()
             }
         }
-        // Safety: cancel any in-flight render whose page is no longer wanted.
-        for (p in running.keys.toList()) {
-            if (p !in targetSet) running.remove(p)?.job?.cancel()
+        // Safety: cancel any in-flight render whose part is no longer wanted.
+        for (part in running.keys.toList()) {
+            if (part !in targetParts) cancel(part)
         }
 
-        // Start or keep renders in priority order.
-        for (p in target) {
-            when (val slot = pages[p]) {
+        // First pass: reconcile every slot, so no stale (spec-mismatched) Ready image or Loading
+        // render survives a budget break below: their bytes are returned before the new
+        // reservations are attempted.
+        for (target in targets) {
+            val part = target.part
+            val spec = Spec(target.src, target.base, target.display)
+            when (val slot = slots[part]) {
                 is PageSlot.Ready -> {
-                    // A Ready page was probed to render it, so its size is known without blocking.
-                    val natural = renderer.knownPageSize(p)
-                    val stale = natural == null || slot.size != baseSize(natural.width, natural.height, viewW, viewH, mode) ||
-                        slot.display != fitSize(natural.width, natural.height, viewW, viewH, mode)
-                    if (stale) {
-                        slot.image.release()
-                        startRender(p, spec)
-                    }
+                    if (readySpecs[part] == spec) continue
+                    readySpecs.remove(part)
+                    slot.image.release() // returns its bytes before the replacement is reserved
+                    slots.remove(part)
                 }
                 is PageSlot.Loading -> {
-                    val r = running[p]
-                    if (r == null || r.spec != spec) {
-                        r?.job?.cancel()
-                        startRender(p, spec)
-                    }
+                    val r = running[part]
+                    if (r != null && r.spec == spec) continue
+                    cancel(part)
+                    slots.remove(part)
                 }
-                is PageSlot.Failed -> Unit // keep the failure until the page is evicted
-                null -> startRender(p, spec)
+                is PageSlot.Failed -> Unit // keep the failure until the part is evicted
+                null -> Unit
             }
         }
 
-        renderer.prefetchHint(current, forward, viewW, viewH)
+        // Second pass: start the missing renders in priority order, until the budget runs out. On
+        // a failed reservation the rest of this update is skipped; it retries on the next update.
+        for (target in targets) {
+            if (slots[target.part] != null) continue // Ready (current spec), Loading or Failed
+            val spec = Spec(target.src, target.base, target.display)
+            if (!startRender(target.part, spec)) break
+        }
+
+        renderer.prefetchHint(prefetch.page, prefetch.forward, prefetch.viewW, prefetch.viewH, prefetch.mode)
     }
 
     /** Waits until every in-flight render has completed (or failed). */
@@ -112,36 +143,59 @@ class PageWindow(
     /** Cancels all work and releases every held image. */
     fun close() {
         closed = true
-        for (r in running.values) r.job.cancel()
-        running.clear()
-        pages.values.filterIsInstance<PageSlot.Ready>().forEach { it.image.release() }
-        pages.clear()
+        for (part in running.keys.toList()) cancel(part)
+        readySpecs.clear()
+        slots.values.filterIsInstance<PageSlot.Ready>().forEach { it.image.release() }
+        slots.clear()
     }
 
-    private fun startRender(page: Int, spec: Spec) {
-        pages[page] = PageSlot.Loading
-        val job = scope.launch {
+    /** Cancels the render of [part]; its reservation returns now if the job never started, else when it ends. */
+    private fun cancel(part: UnitPart) {
+        val r = running.remove(part) ?: return
+        r.job.cancel()
+        // A job cancelled before its body ran never allocates and never reaches its own release.
+        if (r.state.compareAndSet(PENDING, CANCELLED_EARLY)) budget.release(r.bytes)
+    }
+
+    /** Reserves the bytes and launches the render; returns false (and starts nothing) if the budget is full. */
+    private fun startRender(part: UnitPart, spec: Spec): Boolean {
+        val bytes = rgbaBytes(spec.base.width, spec.base.height)
+        if (!budget.tryReserve(bytes)) return false
+        slots[part] = PageSlot.Loading
+        val entry = Running(spec, bytes)
+        // Lazy: the entry must be registered before the body can run, which an immediate dispatcher
+        // (viewModelScope) would otherwise do inside launch.
+        val job = scope.launch(start = CoroutineStart.LAZY) {
+            if (!entry.state.compareAndSet(PENDING, STARTED)) return@launch // cancelled early, already released
+            var handedOver = false
             try {
-                val natural = renderer.knownPageSize(page) ?: renderer.probePageSize(page)
-                val size = baseSize(natural.width, natural.height, spec.viewW, spec.viewH, spec.mode)
-                val display = fitSize(natural.width, natural.height, spec.viewW, spec.viewH, spec.mode)
-                val image = renderer.renderBase(page, size)
-                if (closed) {
+                val image = renderer.renderRegion(
+                    part.page,
+                    PageRegion(spec.src.left, spec.src.top, spec.src.width, spec.src.height, spec.base.width, spec.base.height),
+                )
+                if (closed || running[part] !== entry) {
                     image.release()
                     return@launch
                 }
-                if (page != currentPage) image.prepareToDraw()
-                pages[page] = PageSlot.Ready(image, size, display)
+                if (part.page != currentPage) image.prepareToDraw()
+                val owned = budget.wrap(image, bytes)
+                handedOver = true // the wrapper now returns the bytes
+                readySpecs[part] = spec
+                slots[part] = PageSlot.Ready(owned, spec.base, spec.display)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Throwable) {
-                if (!closed) pages[page] = PageSlot.Failed(reasonOf(e))
+                if (!closed && running[part] === entry) slots[part] = PageSlot.Failed(reasonOf(e))
+            } finally {
+                if (!handedOver) budget.release(bytes)
             }
         }
-        val entry = Running(job, spec)
-        running[page] = entry
+        entry.job = job
+        running[part] = entry
         // Remove the entry only if it is still this job (a later re-render may have replaced it).
-        job.invokeOnCompletion { running.remove(page, entry) }
+        job.invokeOnCompletion { running.remove(part, entry) }
+        job.start()
+        return true
     }
 
     private fun reasonOf(e: Throwable): String = when (e) {
@@ -151,5 +205,11 @@ class PageWindow(
             val message = e.message?.takeIf { it.isNotBlank() }
             if (message != null) "$name: $message" else name
         }
+    }
+
+    private companion object {
+        const val PENDING = 0
+        const val STARTED = 1
+        const val CANCELLED_EARLY = 2
     }
 }

@@ -1,9 +1,7 @@
 package com.proviewer.app.reader
 
+import androidx.compose.ui.unit.IntRect
 import androidx.compose.ui.unit.IntSize
-import kotlin.math.ceil
-import kotlin.math.floor
-import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
@@ -62,8 +60,15 @@ fun fitSize(pageW: Int, pageH: Int, viewW: Int, viewH: Int, mode: FitMode): IntS
  * lower-resolution base that is still drawn (upscaled) at [fitSize]; the detail render supplies
  * sharpness.
  */
-fun baseSize(pageW: Int, pageH: Int, viewW: Int, viewH: Int, mode: FitMode): IntSize {
-    val fitted = fitSize(pageW, pageH, viewW, viewH, mode)
+fun baseSize(pageW: Int, pageH: Int, viewW: Int, viewH: Int, mode: FitMode): IntSize =
+    capBase(fitSize(pageW, pageH, viewW, viewH, mode))
+
+/**
+ * Scales an already-fitted [fitted] size down uniformly until it satisfies the base-bitmap caps
+ * (`MAX_BASE_DIM`, `MAX_BASE_BYTES`); see [baseSize]. Returns [fitted] unchanged when it is within
+ * the caps.
+ */
+fun capBase(fitted: IntSize): IntSize {
     var w = fitted.width
     var h = fitted.height
 
@@ -97,6 +102,23 @@ fun tapAction(x: Float, width: Float, dir: Direction): TapAction {
         x < third -> if (dir == Direction.Ltr) TapAction.Previous else TapAction.Next
         x < 2 * third -> TapAction.ToggleOverlay
         else -> if (dir == Direction.Ltr) TapAction.Next else TapAction.Previous
+    }
+}
+
+/** The fraction of the viewport height one Webtoon tap/volume page-scroll moves (spec 5.2). */
+const val WEBTOON_PAGE_SCROLL = 0.85f
+
+/**
+ * Maps a vertical tap position (Webtoon mode) to an action: top third -> Previous, middle third
+ * -> ToggleOverlay, bottom third -> Next. The Previous/Next turns scroll by [WEBTOON_PAGE_SCROLL]
+ * of the viewport height (spec 5.2's vertical thirds; horizontal thirds elsewhere).
+ */
+fun verticalTapAction(y: Float, height: Float): TapAction {
+    val third = height / 3f
+    return when {
+        y < third -> TapAction.Previous
+        y < 2 * third -> TapAction.ToggleOverlay
+        else -> TapAction.Next
     }
 }
 
@@ -144,6 +166,9 @@ fun windowPages(
  * full page at zoom 1) is drawn at [zoom] with its top-left at ([contentLeft], [contentTop]) in
  * screen pixels.
  *
+ * Delegates to [visiblePartRegion] with the whole page as the source and the base layout as the
+ * destination.
+ *
  * Returns null when the base already provides the on-screen image: at fit scale (`zoom <= 1.001`)
  * and the base matches the viewport in the fitted dimension (`baseW == viewW || baseH == viewH`),
  * unless [baseCapped] says the base bitmap has fewer pixels than its laid-out size (then the fit
@@ -163,34 +188,14 @@ fun visibleRegion(
     viewW: Int,
     viewH: Int,
     baseCapped: Boolean = false,
-): PageRegion? {
-    if (!baseCapped && zoom * baseW <= baseW * 1.001f && (baseW == viewW || baseH == viewH)) return null
-
-    val x0 = max(0f, contentLeft)
-    val y0 = max(0f, contentTop)
-    val x1 = min(viewW.toFloat(), contentLeft + zoom * baseW)
-    val y1 = min(viewH.toFloat(), contentTop + zoom * baseH)
-    if (x1 <= x0 || y1 <= y0) return null
-
-    // Page pixels per on-screen pixel of the (zoomed) base.
-    val sx = pageW.toDouble() / baseW
-    val sy = pageH.toDouble() / baseH
-    val px0 = (x0 - contentLeft) / zoom * sx
-    val py0 = (y0 - contentTop) / zoom * sy
-    val px1 = (x1 - contentLeft) / zoom * sx
-    val py1 = (y1 - contentTop) / zoom * sy
-
-    val x = floor(px0).toInt().coerceIn(0, pageW)
-    val y = floor(py0).toInt().coerceIn(0, pageH)
-    val xEnd = ceil(px1).toInt().coerceIn(0, pageW)
-    val yEnd = ceil(py1).toInt().coerceIn(0, pageH)
-
-    return PageRegion(
-        x = x,
-        y = y,
-        w = (xEnd - x).coerceAtLeast(0),
-        h = (yEnd - y).coerceAtLeast(0),
-        outW = (x1 - x0).roundToInt().coerceAtLeast(1),
-        outH = (y1 - y0).roundToInt().coerceAtLeast(1),
-    )
-}
+): PageRegion? = visiblePartRegion(
+    src = IntRect(0, 0, pageW, pageH),
+    dst = IntRect(0, 0, baseW, baseH),
+    base = IntSize(baseW, baseH),
+    zoom = zoom,
+    contentLeft = contentLeft,
+    contentTop = contentTop,
+    viewW = viewW,
+    viewH = viewH,
+    baseCapped = baseCapped,
+)

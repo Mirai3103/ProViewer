@@ -88,6 +88,9 @@ pub(super) fn decode(bytes: &[u8], denom: u8, limits: &Limits) -> Result<Decoded
     let (out_w, out_h) = (scaled_dim(width, denom), scaled_dim(height, denom));
 
     let colorspace = get_param(tj.handle, raw::TJPARAM_TJPARAM_COLORSPACE as i32)?;
+    // The bindgen `TJPF_*` constants are `i32` on MSVC and `u32` on Linux/Android, so the casts are only
+    // redundant on some targets.
+    #[allow(clippy::unnecessary_cast)]
     let (format, layout, cmyk, channels) = match colorspace as u32 {
         raw::TJCS_TJCS_GRAY => (raw::TJPF_TJPF_GRAY as i32, PixelLayout::Gray8, false, 1u64),
         // libjpeg cannot convert CMYK/YCCK to RGB itself, so it is decoded as CMYK and converted below.

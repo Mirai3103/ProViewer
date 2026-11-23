@@ -180,12 +180,18 @@ private fun ResultsTable(result: BenchmarkResult) {
                 s.cold?.let { "cold(n=${it.n}) p50/p95/max=%.0f/%.0f/%.0f ms".format(it.p50Ms, it.p95Ms, it.maxMs) },
                 s.prefetched?.let { "pref(n=${it.n}) p50/p95/max=%.0f/%.0f/%.0f ms".format(it.p50Ms, it.p95Ms, it.maxMs) },
             ).joinToString(" | ", prefix = " — ").takeIf { it.isNotBlank() } ?: ""
+            // a1's information-only fields (spec 6.6): placeholder frames and the image budget's
+            // peak held bytes during the window.
+            val infoPart = listOfNotNull(
+                s.placeholderFrames?.let { "placeholders=$it" },
+                s.peakImageBytes?.let { "peak=%.1f MiB".format(it / (1024f * 1024f)) },
+            ).joinToString(", ", prefix = " — ").takeIf { it.isNotBlank() } ?: ""
             val flags = buildList {
                 if (s.refreshBeforeHz != s.refreshAfterHz) add("rate changed")
                 if (s.fellBackToSoftware) add("fell back to software")
                 s.aborted?.let { add("aborted: $it") }
             }.joinToString("; ", prefix = " — ").takeIf { it.isNotBlank() } ?: ""
-            Text("${s.id} [${s.strategy.name}] #${s.order} — $framesPart$latencyPart$flags")
+            Text("${s.id} [${s.strategy.name}] #${s.order} — $framesPart$latencyPart$infoPart$flags")
         }
     }
 }

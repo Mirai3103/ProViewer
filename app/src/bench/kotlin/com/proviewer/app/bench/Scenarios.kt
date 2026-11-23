@@ -2,11 +2,13 @@ package com.proviewer.app.bench
 
 import android.os.SystemClock
 import android.util.Log
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.geometry.Offset
 import com.proviewer.app.engine.UploadStrategy
 import com.proviewer.app.reader.ReaderAutomation
 import com.proviewer.app.reader.ReaderProbe
 import com.proviewer.app.reader.ReaderViewModel
+import com.proviewer.app.reader.WebtoonAutomation
 import com.proviewer.app.reader.ZoomAutomation
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
@@ -15,10 +17,10 @@ import kotlinx.coroutines.isActive
 import java.io.File
 
 /** The corpus archives one full benchmark run needs, by name. */
-internal val BENCH_CORPUS_FILES = listOf("mixed-small.cbz", "screentone.cbz", "huge-single.cbz")
+internal val BENCH_CORPUS_FILES = listOf("mixed-small.cbz", "screentone.cbz", "huge-single.cbz", "webtoon-long.cbz")
 
 /** Scenario ids in execution order; every scenario runs once per upload strategy. */
-internal val BENCH_SCENARIO_IDS = listOf("a2", "a3-screentone", "a3-huge", "b")
+internal val BENCH_SCENARIO_IDS = listOf("a1", "a2", "a3-screentone", "a3-huge", "b")
 
 /**
  * Everything a scenario needs from the runner. The runner implements it per scenario invocation
@@ -39,9 +41,16 @@ internal interface ScenarioContext {
 
     /**
      * Hosts the real ReaderScreen with a freshly opened [file] for the duration of [block],
-     * waits until page 0 is rendered and idle, and tears the reader down afterwards.
+     * waits until page 0 is rendered and idle (or, with [webtoon], until the auto-resolved
+     * Webtoon session has its first tiles ready), and tears the reader down afterwards. With
+     * [webtoon] the layout choice stays at Auto so a strip book resolves Webtoon (a1's "auto
+     * Webtoon"); otherwise the Single layout is pinned as every pager scenario assumes.
      */
-    suspend fun <T> withFreshReader(file: File, block: suspend (ReaderViewModel, ReaderAutomation) -> T): T
+    suspend fun <T> withFreshReader(
+        file: File,
+        webtoon: Boolean = false,
+        block: suspend (ReaderViewModel, ReaderAutomation) -> T,
+    ): T
 }
 
 /** Raw scenario data, before the runner turns it into a [ScenarioResult]. */
@@ -51,6 +60,10 @@ internal data class ScenarioOutcome(
     val prefetchedMs: List<Double>? = null,
     val fellBackToSoftware: Boolean = false,
     val aborted: String? = null,
+    /** a1 only: frames that drew a placeholder in the Webtoon viewport's visible area. */
+    val placeholderFrames: Int? = null,
+    /** a1 only: the image budget's highest held bytes during the measurement window. */
+    val peakImageBytes: Long? = null,
 )
 
 /**
@@ -60,13 +73,27 @@ internal data class ScenarioOutcome(
 class BenchProbe : ReaderProbe {
     private val lock = Any()
     private val sharpDraws = mutableListOf<Pair<Int, Long>>()
+    private var placeholderFrames = 0
 
     override fun onSharpPageDrawn(page: Int, drawNanos: Long) {
         synchronized(lock) { sharpDraws += page to drawNanos }
     }
 
+    override fun onPlaceholderDrawn() {
+        synchronized(lock) { placeholderFrames += 1 }
+    }
+
     /** Forgets all recorded events; called right before a new book is attached. */
-    fun clear() = synchronized(lock) { sharpDraws.clear() }
+    fun clear() = synchronized(lock) {
+        sharpDraws.clear()
+        placeholderFrames = 0
+    }
+
+    /** Forgets the placeholder count; a1 calls it at its measurement window's start. */
+    fun clearPlaceholderCount() = synchronized(lock) { placeholderFrames = 0 }
+
+    /** The [ReaderProbe.onPlaceholderDrawn] count since the last [clearPlaceholderCount]. */
+    fun placeholderCount(): Int = synchronized(lock) { placeholderFrames }
 
     /** True when page [page]'s sharp bitmap has been drawn since the last [clear]. */
     fun hasSharpDraw(page: Int): Boolean = synchronized(lock) { sharpDraws.any { it.first == page } }
@@ -186,12 +213,60 @@ private suspend fun awaitZoomAutomation(automation: ReaderAutomation, id: String
     }
 }
 
-/** Waits until the reader's pager has actually settled on [page] (correctness, not timing). */
-private suspend fun awaitSettled(vm: ReaderViewModel, page: Int) {
+/**
+ * a1: Webtoon scroll on `webtoon-long.cbz` (auto-resolved Webtoon at 1×; spec 6.6): a steady
+ * scripted descent at a constant speed — one [WebtoonAutomation.scrollBy] per composed frame —
+ * to the column's end, then [A1_FLING_COUNT] flings back up the book, each followed by a settle.
+ * Frames are recorded across the whole window; the window's [ReaderProbe.onPlaceholderDrawn]
+ * count and the image budget's peak bytes are reported for information only.
+ */
+internal suspend fun scenarioA1(ctx: ScenarioContext, file: File): ScenarioOutcome =
+    ctx.withFreshReader(file, webtoon = true) { vm, automation ->
+        val webtoon = awaitWebtoonAutomation(automation)
+        vm.budget?.resetPeak()
+        ctx.probe.clearPlaceholderCount()
+        ctx.recorder.start()
+        // Steady descent: one scrollBy per composed frame, scaled by that frame's duration so the
+        // scroll speed stays constant regardless of the refresh rate.
+        var lastNs = withFrameNanos { it }
+        while (webtoon.scrollY < webtoon.maxScroll) {
+            ctx.abortCheckpoint()
+            val ns = withFrameNanos { it }
+            val dy = A1_SCROLL_SPEED_PX_PER_S * (ns - lastNs) / 1_000_000_000.0
+            lastNs = ns
+            webtoon.scrollBy(dy.toFloat())
+        }
+        // The flings return up the book (spec 6.6 "flings back up"): the plan's -8000 px/s is the
+        // scroll-progress velocity (scrollY decreasing, like the +4000 above is scrollY
+        // increasing), while the automation's velocity is the release velocity whose sign is
+        // negated ("positive scrolls up" — scrollY decreases), so the API value is +8000.
+        repeat(A1_FLING_COUNT) {
+            ctx.abortCheckpoint()
+            webtoon.fling(A1_FLING_VELOCITY_PX_PER_S)
+            delay(A1_FLING_SETTLE_MS)
+        }
+        // Correctness guard: at maxScroll an upward fling must move the viewport; a fling that
+        // stayed clamped means the scripted direction was wrong (never timing).
+        if (webtoon.scrollY >= webtoon.maxScroll) {
+            throw IllegalStateException("a1: the upward flings never moved the viewport")
+        }
+        delay(METRICS_SETTLE_MS)
+        val frames = ctx.recorder.stop()
+        ScenarioOutcome(
+            frames = jankSummary(frames),
+            fellBackToSoftware = vm.renderer?.fellBack == true,
+            placeholderFrames = ctx.probe.placeholderCount(),
+            peakImageBytes = vm.budget?.peakBytes,
+        )
+    }
+
+/** Waits until the Webtoon session's automation is published (auto-resolved Webtoon). */
+private suspend fun awaitWebtoonAutomation(automation: ReaderAutomation): WebtoonAutomation {
     val deadline = SystemClock.elapsedRealtime() + ACTION_TIMEOUT_MS
-    while (vm.settledPage != page) {
+    while (true) {
+        automation.webtoon?.let { return it }
         if (SystemClock.elapsedRealtime() >= deadline) {
-            throw IllegalStateException("pager never settled on page $page (settled=${vm.settledPage})")
+            throw IllegalStateException("webtoon automation never published")
         }
         delay(STEP_POLL_MS)
     }
@@ -199,12 +274,13 @@ private suspend fun awaitSettled(vm: ReaderViewModel, page: Int) {
 
 /**
  * b: page-turn latency on `mixed-small.cbz`. Cold samples (10) each open a fresh book, wait until
- * page 0 is idle, then snap-turn to a far page (5, 10, 15 cycling); prefetched samples (19) turn
- * to the next page after `awaitIdle` on one book. t0 = `System.nanoTime()` just before the turn;
- * t1 = the end of the frame containing the page's sharp draw (the draw time itself, flagged, when
- * no recorded frame covers it). Prefetched targets usually draw (and fire their once-per-bitmap
- * probe) at rest while adjacent to the current page, so when no post-turn event exists the
- * settled frame is used instead and the sample is flagged.
+ * page 0 is idle, then snap-turn to a far page (5, 10, 15 cycling); prefetched samples (19) also
+ * snap-turn (`animate = false`; E5) to the next page after `awaitIdle` on one book, so t1 measures
+ * what the budget is for: the bitmap is ready and its upload must not stall the frame. t0 =
+ * `System.nanoTime()` just before the turn; t1 = the end of the frame containing the page's sharp
+ * draw (the draw time itself, flagged, when no recorded frame covers it). The probe fires only
+ * while the drawn page is the current one, and a page drawn at rest as a neighbour never fired,
+ * so every turn produces a fresh event; a missing event is a correctness failure like cold.
  */
 internal suspend fun scenarioB(ctx: ScenarioContext, file: File, onProgress: (String) -> Unit): ScenarioOutcome {
     val cold = mutableListOf<Double>()
@@ -240,33 +316,18 @@ internal suspend fun scenarioB(ctx: ScenarioContext, file: File, onProgress: (St
             automation.awaitIdle()
             ctx.recorder.start()
             val t0 = System.nanoTime()
-            tolerateInterruption { automation.turnTo(p + 1, animate = true) }
-            // The scripted animation may have been taken over by the reader's own (which
-            // interrupts the scripted one), so wait for a real settle before referencing time.
-            awaitSettled(vm, p + 1)
-            val settledNs = System.nanoTime()
+            // E5: the prefetched turns snap, so no settle wait is needed before referencing time.
+            tolerateInterruption { automation.turnTo(p + 1, animate = false) }
+            // The probe fires only while the drawn page is the current one, and a page drawn at
+            // rest as a neighbour never fired, so the snap turn always produces a fresh event.
+            // A missing event is a correctness failure, exactly like the cold samples'.
+            val drawNs = ctx.probe.awaitSharpDraw(p + 1, t0, ACTION_TIMEOUT_MS)
+                ?: throw IllegalStateException(
+                    "no sharp page draw for prefetched page ${p + 1} within ${ACTION_TIMEOUT_MS}ms",
+                )
             delay(METRICS_SETTLE_MS)
             val frames = ctx.recorder.stop()
-            // The probe fires once per bitmap, and a target that sat adjacent to the current page
-            // has already drawn (and fired) at rest before the turn, so a post-turn sharp-draw
-            // event often cannot exist. Prefer one when observable; otherwise fall back to the
-            // settled frame and flag the sample in the run log. Only wait when the page never
-            // drew at all (it may still be rendering): then the turn itself draws it.
-            val drawNs = ctx.probe.sharpDrawAtOrAfter(p + 1, t0)
-                ?: (if (ctx.probe.hasSharpDraw(p + 1)) {
-                    null
-                } else {
-                    ctx.probe.awaitSharpDraw(p + 1, t0, SHARP_DRAW_WAIT_MS)
-                })
-            var flagged = false
-            val referenceNs = when {
-                drawNs != null -> frameEndContaining(drawNs, frames) ?: drawNs.also { flagged = true }
-                else -> null
-            } ?: frameEndContaining(settledNs, frames) ?: settledNs.also { flagged = true }
-            if (flagged) {
-                Log.i(TAG, "b prefetched page ${p + 1}: sample flagged (no post-turn sharp draw; used the settled time)")
-            }
-            samples += (referenceNs - t0) / 1_000_000.0
+            samples += latencyMs(t0, drawNs, frames)
         }
         fellBack = fellBack || vm.renderer?.fellBack == true
         samples
@@ -296,6 +357,18 @@ private const val A2_TURN_INTERVAL_MS = 450L
 private const val A3_CYCLES = 3
 private const val A3_STEP_WAIT_MS = 300L
 
+/** a1: the steady descent's scroll speed (content px/s at 1x; pinned by the plan's script). */
+private const val A1_SCROLL_SPEED_PX_PER_S = 4000.0
+
+/**
+ * a1: the flings back up the book after the descent (spec 6.6), and the settle between them. The
+ * velocity is in the automation's release-velocity units ("positive scrolls up"); the plan's
+ * -8000 px/s is the same fling expressed as scroll-progress velocity (scrollY decreasing).
+ */
+private const val A1_FLING_COUNT = 4
+private const val A1_FLING_VELOCITY_PX_PER_S = 8000f
+private const val A1_FLING_SETTLE_MS = 300L
+
 /** b cold: 10 fresh-book samples turning to 5, 10, 15 cyclically. */
 private const val B_COLD_SAMPLES = 10
 private val B_COLD_TARGETS = intArrayOf(5, 10, 15)
@@ -306,6 +379,3 @@ private const val METRICS_SETTLE_MS = 150L
 /** Generous timeouts: correctness, never timing (documented cached-app-freezer stalls). */
 private const val ACTION_TIMEOUT_MS = 60_000L
 private const val STEP_POLL_MS = 25L
-
-/** Wait for a late sharp-draw event on a target that had not drawn at all before its turn. */
-private const val SHARP_DRAW_WAIT_MS = 1_000L

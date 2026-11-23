@@ -46,15 +46,17 @@
 //! # Counters
 //!
 //! `decodes` counts decode closures that ran (successful or not), from render and prefetch alike.
-//! `cache_hits` counts `render_tile` calls served without running a decode, including a render that joined an
-//! in-flight decode; prefetch jobs never count hits.
+//! `cache_hits` counts `render_tile` and `render_scaled_tile` calls served without running a decode, including a
+//! render that joined an in-flight decode; prefetch jobs never count hits.
 
 use crate::archive::{open_path, PageSource};
 use crate::cache::{CacheKey, DecodeCache};
 use crate::decode::{decode, probe, supported_denoms, DecodedImage, PageInfo};
 use crate::error::{EngineError, Result};
 use crate::limits::Limits;
-use crate::resize::{choose_denom, render_region, Rect};
+use crate::resize::{
+    choose_denom, render_region, render_scaled_region, validate_scaled_rect, Rect,
+};
 use crate::scheduler::PrefetchPool;
 use std::fs::File;
 #[cfg(unix)]
@@ -121,6 +123,31 @@ pub struct TileRequest {
     pub out_height: u32,
 }
 
+/// How a page is fitted into the viewport; picks the decode size a prefetch warms.
+#[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FitTarget {
+    /// The whole page inside the viewport ([`fit_size`]).
+    Screen,
+    /// The page width equals the viewport width; the height may overflow the viewport.
+    Width,
+    /// The page height equals the viewport height; the width may overflow the viewport.
+    Height,
+}
+
+/// A request for the `out_width x out_height` rectangle at `(out_x, out_y)` of page `page` rendered as a whole
+/// to a virtual `full_width x full_height` size. Tiles of one full size match the corresponding rows and columns
+/// of a single full render within 1 channel level, with no gap, overlap or row/column jump at their seams.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScaledTileRequest {
+    pub page: u32,
+    pub full_width: u32,
+    pub full_height: u32,
+    pub out_x: u32,
+    pub out_y: u32,
+    pub out_width: u32,
+    pub out_height: u32,
+}
+
 /// Cooperative cancellation flag for [`Book::render_tile`]. Clones share the flag.
 #[derive(Clone, Default)]
 pub struct CancelToken(Arc<AtomicBool>);
@@ -147,6 +174,26 @@ pub fn fit_size(page_w: u32, page_h: u32, view_w: u32, view_h: u32) -> (u32, u32
     let scale = (vw as f64 / pw).min(vh as f64 / ph);
     let dim = |p: f64, v: u32| ((p * scale).round() as u32).clamp(1, v);
     (dim(pw, vw), dim(ph, vh))
+}
+
+/// Size of a `page_w x page_h` page fitted to `view_w x view_h` by `fit`, rounded, at least 1 in each dimension.
+/// `Screen` is [`fit_size`]; `Width` is `(view_w, round(page_h * view_w / page_w))` and `Height` the symmetric
+/// case, neither clamped to the viewport.
+pub fn fit_size_for(
+    page_w: u32,
+    page_h: u32,
+    view_w: u32,
+    view_h: u32,
+    fit: FitTarget,
+) -> (u32, u32) {
+    let (pw, ph) = (page_w.max(1) as f64, page_h.max(1) as f64);
+    let (vw, vh) = (view_w.max(1), view_h.max(1));
+    let scaled = |p: f64, v: u32, edge: f64| ((p * v as f64 / edge).round() as u32).max(1);
+    match fit {
+        FitTarget::Screen => fit_size(page_w, page_h, view_w, view_h),
+        FitTarget::Width => (vw, scaled(ph, vw, pw)),
+        FitTarget::Height => (scaled(pw, vh, ph), vh),
+    }
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -388,15 +435,15 @@ impl BookInner {
         self.closed.load(Ordering::SeqCst) || self.generation.load(Ordering::SeqCst) != generation
     }
 
-    /// Body of a prefetch job: warm exactly the entry a fit render of `page` would ask for.
-    fn prefetch_page(&self, generation: u64, page: u32, view_w: u32, view_h: u32) {
+    /// Body of a prefetch job: warm exactly the entry a `fit` render of `page` would ask for.
+    fn prefetch_page(&self, generation: u64, page: u32, view_w: u32, view_h: u32, fit: FitTarget) {
         if self.is_stale(generation) {
             return;
         }
         let Ok(info) = self.page_info(page) else {
             return; // a broken page is reported when the reader actually shows it
         };
-        let (out_w, out_h) = fit_size(info.width, info.height, view_w, view_h);
+        let (out_w, out_h) = fit_size_for(info.width, info.height, view_w, view_h, fit);
         let region = Rect {
             x: 0,
             y: 0,
@@ -420,13 +467,7 @@ impl BookInner {
         let invalid = |message: &str| EngineError::InvalidRequest {
             message: message.to_string(),
         };
-        if req.out_width == 0 || req.out_height == 0 {
-            return Err(invalid("output size must be non-zero"));
-        }
-        let out_pixels = req.out_width as u64 * req.out_height as u64;
-        if out_pixels > self.core.limits.max_image_pixels {
-            return Err(invalid("output exceeds the pixel limit"));
-        }
+        self.validate_output(req.out_width, req.out_height, dst_len, dst_stride)?;
         let region = req.region;
         if region.width == 0 || region.height == 0 {
             return Err(invalid("region is empty"));
@@ -442,14 +483,36 @@ impl BookInner {
         if !inside {
             return Err(invalid("region is outside the page"));
         }
-        let row_bytes = (req.out_width as usize)
+        Ok(())
+    }
+
+    /// Checks an `out_w x out_h` output: non-zero, within the pixel limit, and `dst` large enough for rows
+    /// `dst_stride` bytes apart. Shared by [`Book::render_tile`] and [`Book::render_scaled_tile`].
+    fn validate_output(
+        &self,
+        out_w: u32,
+        out_h: u32,
+        dst_len: usize,
+        dst_stride: usize,
+    ) -> Result<()> {
+        let invalid = |message: &str| EngineError::InvalidRequest {
+            message: message.to_string(),
+        };
+        if out_w == 0 || out_h == 0 {
+            return Err(invalid("output size must be non-zero"));
+        }
+        let out_pixels = out_w as u64 * out_h as u64;
+        if out_pixels > self.core.limits.max_image_pixels {
+            return Err(invalid("output exceeds the pixel limit"));
+        }
+        let row_bytes = (out_w as usize)
             .checked_mul(4)
             .ok_or_else(|| invalid("output row size overflows"))?;
         if dst_stride < row_bytes {
             return Err(invalid("dst_stride is smaller than out_width * 4"));
         }
         let needed = dst_stride
-            .checked_mul(req.out_height as usize - 1)
+            .checked_mul(out_h as usize - 1)
             .and_then(|n| n.checked_add(row_bytes))
             .ok_or_else(|| invalid("output buffer size overflows"))?;
         if dst_len < needed {
@@ -499,13 +562,15 @@ impl Book {
 
     /// Supersedes every earlier hint of this book and queues decodes for the pages around `current`: up to
     /// `prefetch_ahead` pages in `direction` and `prefetch_behind` the other way, nearest first, out-of-range
-    /// pages skipped. Each job decodes at the denom a fit render for the viewport would use. Never blocks.
+    /// pages skipped. Each job decodes at the denom a `fit` render for the viewport would use (Webtoon and fit
+    /// width pass `Width`). Never blocks.
     pub fn prefetch_hint(
         &self,
         current: u32,
         direction: ReadDirection,
         viewport_width: u32,
         viewport_height: u32,
+        fit: FitTarget,
     ) {
         let generation = self.inner.generation.fetch_add(1, Ordering::SeqCst) + 1;
         if viewport_width == 0 || viewport_height == 0 {
@@ -530,7 +595,7 @@ impl Book {
                     let Some(inner) = weak.upgrade() else {
                         return;
                     };
-                    inner.prefetch_page(generation, page, viewport_width, viewport_height);
+                    inner.prefetch_page(generation, page, viewport_width, viewport_height, fit);
                 }),
             );
         }
@@ -585,6 +650,66 @@ impl Book {
             info.width,
             info.height,
             req.region,
+            req.out_width,
+            req.out_height,
+            dst,
+            dst_stride,
+        )
+    }
+
+    /// Renders the `req.out_width x req.out_height` rectangle at `(req.out_x, req.out_y)` of page `req.page`
+    /// scaled as a whole to `req.full_width x req.full_height`, into `dst` (RGBA8888 rows `dst_stride` bytes
+    /// apart; padding untouched). The decode denom is the one of a whole-page render at the full size, so every
+    /// tile of one full size shares one decode and one page <-> output mapping. Everything is validated before
+    /// anything is decoded.
+    pub fn render_scaled_tile(
+        &self,
+        req: &ScaledTileRequest,
+        dst: &mut [u8],
+        dst_stride: usize,
+        cancel: &CancelToken,
+    ) -> Result<()> {
+        let inner = &*self.inner;
+        let info = inner.page_info(req.page)?;
+        validate_scaled_rect(
+            req.full_width,
+            req.full_height,
+            req.out_x,
+            req.out_y,
+            req.out_width,
+            req.out_height,
+        )?;
+        inner.validate_output(req.out_width, req.out_height, dst.len(), dst_stride)?;
+        if cancel.is_cancelled() {
+            return Err(EngineError::Cancelled);
+        }
+        let whole = Rect {
+            x: 0,
+            y: 0,
+            width: info.width,
+            height: info.height,
+        };
+        let denom = choose_denom(
+            whole,
+            req.full_width,
+            req.full_height,
+            supported_denoms(info.format),
+        );
+        let (image, decoded) = inner.decode_page(req.page, denom)?;
+        if !decoded {
+            inner.core.cache_hits.fetch_add(1, Ordering::SeqCst);
+        }
+        if cancel.is_cancelled() {
+            return Err(EngineError::Cancelled);
+        }
+        render_scaled_region(
+            &image,
+            info.width,
+            info.height,
+            req.full_width,
+            req.full_height,
+            req.out_x,
+            req.out_y,
             req.out_width,
             req.out_height,
             dst,

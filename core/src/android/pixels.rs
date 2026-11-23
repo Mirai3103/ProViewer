@@ -1,7 +1,8 @@
 //! JNI exports for `com.proviewer.app.engine.NativePixels`.
 //!
 //! Each export resolves the book/cancel handles from the registries in [`crate::handles`], then
-//! calls [`Book::render_tile`] straight into the pixels of a locked `Bitmap` or `AHardwareBuffer`.
+//! calls [`Book::render_tile`] or [`Book::render_scaled_tile`] straight into the pixels of a locked
+//! `Bitmap` or `AHardwareBuffer`.
 //! Every export runs inside [`EnvUnowned::with_env`]'s `catch_unwind`, so a panic is caught and
 //! rethrown to Kotlin as a [`NativeRenderException`] with kind `"Panic"` rather than unwinding
 //! across the FFI boundary.
@@ -14,7 +15,7 @@ use jni::objects::{JObject, JString, JThrowable};
 use jni::sys::{jint, jlong};
 use jni::{jni_mangle, jni_sig, jni_str, Env, EnvUnowned, JValue, Outcome};
 
-use crate::engine::{Book, CancelToken, TileRequest};
+use crate::engine::{Book, CancelToken, ScaledTileRequest, TileRequest};
 use crate::error::EngineError;
 use crate::resize::Rect;
 
@@ -171,6 +172,119 @@ impl Drop for BitmapLock {
     }
 }
 
+/// Locks the pixels of `bitmap` (format must be `RGBA_8888`) and calls `f(dst, stride, width, height)` with
+/// them; the pixels are unlocked on every exit path.
+fn with_bitmap_pixels<'local, T>(
+    env: &mut Env<'local>,
+    bitmap: &JObject<'local>,
+    f: impl FnOnce(&mut [u8], usize, u32, u32) -> Result<T, RenderError>,
+) -> Result<T, RenderError> {
+    let mut info = MaybeUninit::<ffi::AndroidBitmapInfo>::zeroed();
+    let rc =
+        unsafe { ffi::AndroidBitmap_getInfo(env.get_raw(), bitmap.as_raw(), info.as_mut_ptr()) };
+    if rc != ffi::ANDROID_BITMAP_RESULT_SUCCESS {
+        return Err(invalid("AndroidBitmap_getInfo failed"));
+    }
+    let info = unsafe { info.assume_init() };
+    if info.format != ffi::ANDROID_BITMAP_FORMAT_RGBA_8888 {
+        return Err(invalid("bitmap format must be RGBA_8888"));
+    }
+
+    let mut addr: *mut c_void = std::ptr::null_mut();
+    let rc = unsafe { ffi::AndroidBitmap_lockPixels(env.get_raw(), bitmap.as_raw(), &mut addr) };
+    if rc != ffi::ANDROID_BITMAP_RESULT_SUCCESS || addr.is_null() {
+        return Err(invalid("AndroidBitmap_lockPixels failed"));
+    }
+    let _guard = BitmapLock {
+        env: env.get_raw(),
+        bitmap: bitmap.as_raw(),
+    };
+    let dst_stride = info.stride as usize;
+    let dst_len = dst_stride.saturating_mul(info.height as usize);
+    let dst = unsafe { std::slice::from_raw_parts_mut(addr as *mut u8, dst_len) };
+    f(dst, dst_stride, info.width, info.height)
+}
+
+/// Locks `buffer` (format must be `R8G8B8A8_UNORM` with CPU-write usage) with `CPU_WRITE_OFTEN` and calls
+/// `f(dst, stride, width, height)` with its pixels (stride = `desc.stride * 4`); the buffer is unlocked on every
+/// exit path.
+fn with_hardware_buffer_pixels<'local, T>(
+    env: &mut Env<'local>,
+    buffer: &JObject<'local>,
+    f: impl FnOnce(&mut [u8], usize, u32, u32) -> Result<T, RenderError>,
+) -> Result<T, RenderError> {
+    let ahb = unsafe { ffi::AHardwareBuffer_fromHardwareBuffer(env.get_raw(), buffer.as_raw()) };
+    if ahb.is_null() {
+        return Err(invalid("not a HardwareBuffer"));
+    }
+
+    let mut desc = MaybeUninit::<ffi::AHardwareBufferDesc>::zeroed();
+    unsafe { ffi::AHardwareBuffer_describe(ahb as *const ffi::AHardwareBuffer, desc.as_mut_ptr()) };
+    let desc = unsafe { desc.assume_init() };
+    if desc.format != ffi::AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM {
+        return Err(invalid("HardwareBuffer format must be R8G8B8A8_UNORM"));
+    }
+    if desc.usage & ffi::AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN == 0 {
+        return Err(invalid("HardwareBuffer must have CPU-write usage"));
+    }
+
+    let stride = (desc.stride as usize).saturating_mul(4);
+    let mut addr: *mut c_void = std::ptr::null_mut();
+    let rc = unsafe {
+        ffi::AHardwareBuffer_lock(
+            ahb,
+            ffi::AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN,
+            -1,
+            std::ptr::null(),
+            &mut addr,
+        )
+    };
+    if rc != 0 || addr.is_null() {
+        return Err(invalid("AHardwareBuffer_lock failed"));
+    }
+    let _guard = HardwareBufferLock { buffer: ahb };
+    let dst_len = stride.saturating_mul(desc.height as usize);
+    let dst = unsafe { std::slice::from_raw_parts_mut(addr as *mut u8, dst_len) };
+    f(dst, stride, desc.width, desc.height)
+}
+
+fn region_arg(x: jint, y: jint, w: jint, h: jint) -> Result<Rect, RenderError> {
+    Ok(Rect {
+        x: u32_arg(x)?,
+        y: u32_arg(y)?,
+        width: u32_arg(w)?,
+        height: u32_arg(h)?,
+    })
+}
+
+/// Builds a scaled-tile request from JNI arguments; the target must be exactly `w x h`.
+#[allow(clippy::too_many_arguments)]
+fn scaled_request(
+    page: jint,
+    full_w: jint,
+    full_h: jint,
+    x: jint,
+    y: jint,
+    w: jint,
+    h: jint,
+    target_w: u32,
+    target_h: u32,
+) -> Result<ScaledTileRequest, RenderError> {
+    let req = ScaledTileRequest {
+        page: u32_arg(page)?,
+        full_width: u32_arg(full_w)?,
+        full_height: u32_arg(full_h)?,
+        out_x: u32_arg(x)?,
+        out_y: u32_arg(y)?,
+        out_width: u32_arg(w)?,
+        out_height: u32_arg(h)?,
+    };
+    if (target_w, target_h) != (req.out_width, req.out_height) {
+        return Err(invalid("target size must equal the requested tile size"));
+    }
+    Ok(req)
+}
+
 /// `NativePixels.renderToBitmap(book, page, x, y, w, h, bitmap, cancel)`: output size = bitmap size,
 /// format must be `RGBA_8888`, stride from `AndroidBitmapInfo`.
 #[jni_mangle("com.proviewer.app.engine.NativePixels", "renderToBitmap")]
@@ -188,48 +302,17 @@ pub fn render_to_bitmap<'local>(
 ) {
     catch_and_throw(&mut env, |env| -> Result<(), RenderError> {
         let (book, cancel_token) = resolve(book, cancel)?;
-        let region = Rect {
-            x: u32_arg(x)?,
-            y: u32_arg(y)?,
-            width: u32_arg(w)?,
-            height: u32_arg(h)?,
-        };
-
-        let mut info = MaybeUninit::<ffi::AndroidBitmapInfo>::zeroed();
-        let rc = unsafe {
-            ffi::AndroidBitmap_getInfo(env.get_raw(), bitmap.as_raw(), info.as_mut_ptr())
-        };
-        if rc != ffi::ANDROID_BITMAP_RESULT_SUCCESS {
-            return Err(invalid("AndroidBitmap_getInfo failed"));
-        }
-        let info = unsafe { info.assume_init() };
-        if info.format != ffi::ANDROID_BITMAP_FORMAT_RGBA_8888 {
-            return Err(invalid("bitmap format must be RGBA_8888"));
-        }
-
-        let req = TileRequest {
-            page: u32_arg(page)?,
-            region,
-            out_width: info.width,
-            out_height: info.height,
-        };
-
-        let mut addr: *mut c_void = std::ptr::null_mut();
-        let rc = unsafe {
-            ffi::AndroidBitmap_lockPixels(env.get_raw(), bitmap.as_raw(), &mut addr)
-        };
-        if rc != ffi::ANDROID_BITMAP_RESULT_SUCCESS || addr.is_null() {
-            return Err(invalid("AndroidBitmap_lockPixels failed"));
-        }
-        let _guard = BitmapLock {
-            env: env.get_raw(),
-            bitmap: bitmap.as_raw(),
-        };
-        let dst_stride = info.stride as usize;
-        let dst_len = dst_stride.saturating_mul(info.height as usize);
-        let dst = unsafe { std::slice::from_raw_parts_mut(addr as *mut u8, dst_len) };
-        book.render_tile(&req, dst, dst_stride, &cancel_token)
-            .map_err(RenderError::from)
+        let region = region_arg(x, y, w, h)?;
+        let page = u32_arg(page)?;
+        with_bitmap_pixels(env, &bitmap, |dst, stride, width, height| {
+            let req = TileRequest {
+                page,
+                region,
+                out_width: width,
+                out_height: height,
+            };
+            Ok(book.render_tile(&req, dst, stride, &cancel_token)?)
+        })
     });
 }
 
@@ -250,55 +333,73 @@ pub fn render_to_hardware_buffer<'local>(
 ) {
     catch_and_throw(&mut env, |env| -> Result<(), RenderError> {
         let (book, cancel_token) = resolve(book, cancel)?;
-        let region = Rect {
-            x: u32_arg(x)?,
-            y: u32_arg(y)?,
-            width: u32_arg(w)?,
-            height: u32_arg(h)?,
-        };
+        let region = region_arg(x, y, w, h)?;
+        let page = u32_arg(page)?;
+        with_hardware_buffer_pixels(env, &buffer, |dst, stride, width, height| {
+            let req = TileRequest {
+                page,
+                region,
+                out_width: width,
+                out_height: height,
+            };
+            Ok(book.render_tile(&req, dst, stride, &cancel_token)?)
+        })
+    });
+}
 
-        let ahb =
-            unsafe { ffi::AHardwareBuffer_fromHardwareBuffer(env.get_raw(), buffer.as_raw()) };
-        if ahb.is_null() {
-            return Err(invalid("not a HardwareBuffer"));
-        }
+/// `NativePixels.renderScaledToBitmap(book, page, fullW, fullH, x, y, w, h, bitmap, cancel)`: the `w x h`
+/// rectangle at `(x, y)` of page `page` scaled as a whole to `fullW x fullH`. The bitmap must be exactly
+/// `w x h` and `RGBA_8888`; stride from `AndroidBitmapInfo`.
+#[jni_mangle("com.proviewer.app.engine.NativePixels", "renderScaledToBitmap")]
+pub fn render_scaled_to_bitmap<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    book: jlong,
+    page: jint,
+    full_w: jint,
+    full_h: jint,
+    x: jint,
+    y: jint,
+    w: jint,
+    h: jint,
+    bitmap: JObject<'local>,
+    cancel: jlong,
+) {
+    catch_and_throw(&mut env, |env| -> Result<(), RenderError> {
+        let (book, cancel_token) = resolve(book, cancel)?;
+        with_bitmap_pixels(env, &bitmap, |dst, stride, width, height| {
+            let req = scaled_request(page, full_w, full_h, x, y, w, h, width, height)?;
+            Ok(book.render_scaled_tile(&req, dst, stride, &cancel_token)?)
+        })
+    });
+}
 
-        let mut desc = MaybeUninit::<ffi::AHardwareBufferDesc>::zeroed();
-        unsafe { ffi::AHardwareBuffer_describe(ahb as *const ffi::AHardwareBuffer, desc.as_mut_ptr()) };
-        let desc = unsafe { desc.assume_init() };
-        if desc.format != ffi::AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM {
-            return Err(invalid("HardwareBuffer format must be R8G8B8A8_UNORM"));
-        }
-        if desc.usage & ffi::AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN == 0 {
-            return Err(invalid("HardwareBuffer must have CPU-write usage"));
-        }
-
-        let stride = (desc.stride as usize).saturating_mul(4);
-        let req = TileRequest {
-            page: u32_arg(page)?,
-            region,
-            out_width: desc.width,
-            out_height: desc.height,
-        };
-
-        let mut addr: *mut c_void = std::ptr::null_mut();
-        let rc = unsafe {
-            ffi::AHardwareBuffer_lock(
-                ahb,
-                ffi::AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN,
-                -1,
-                std::ptr::null(),
-                &mut addr,
-            )
-        };
-        if rc != 0 || addr.is_null() {
-            return Err(invalid("AHardwareBuffer_lock failed"));
-        }
-        let _guard = HardwareBufferLock { buffer: ahb };
-        let dst_len = stride.saturating_mul(desc.height as usize);
-        let dst = unsafe { std::slice::from_raw_parts_mut(addr as *mut u8, dst_len) };
-        book.render_tile(&req, dst, stride, &cancel_token)
-            .map_err(RenderError::from)
+/// `NativePixels.renderScaledToHardwareBuffer(book, page, fullW, fullH, x, y, w, h, buffer, cancel)`: as
+/// [`render_scaled_to_bitmap`] into a `w x h` `R8G8B8A8_UNORM` buffer with CPU-write usage.
+#[jni_mangle(
+    "com.proviewer.app.engine.NativePixels",
+    "renderScaledToHardwareBuffer"
+)]
+pub fn render_scaled_to_hardware_buffer<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    book: jlong,
+    page: jint,
+    full_w: jint,
+    full_h: jint,
+    x: jint,
+    y: jint,
+    w: jint,
+    h: jint,
+    buffer: JObject<'local>,
+    cancel: jlong,
+) {
+    catch_and_throw(&mut env, |env| -> Result<(), RenderError> {
+        let (book, cancel_token) = resolve(book, cancel)?;
+        with_hardware_buffer_pixels(env, &buffer, |dst, stride, width, height| {
+            let req = scaled_request(page, full_w, full_h, x, y, w, h, width, height)?;
+            Ok(book.render_scaled_tile(&req, dst, stride, &cancel_token)?)
+        })
     });
 }
 

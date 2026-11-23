@@ -56,6 +56,24 @@ class ReaderLogicTest {
         assertZones(Direction.Rtl, TapAction.Next, TapAction.Previous)
     }
 
+    // --- verticalTapAction / WEBTOON_PAGE_SCROLL (Webtoon tap zones) ----------
+
+    @Test
+    fun vertical_tap_action_covers_all_zones() {
+        val height = 300f
+        assertEquals("top third", TapAction.Previous, verticalTapAction(0f, height))
+        assertEquals("top third", TapAction.Previous, verticalTapAction(99.9f, height))
+        assertEquals("middle third", TapAction.ToggleOverlay, verticalTapAction(100f, height))
+        assertEquals("middle third", TapAction.ToggleOverlay, verticalTapAction(150f, height))
+        assertEquals("bottom third", TapAction.Next, verticalTapAction(200f, height))
+        assertEquals("bottom third", TapAction.Next, verticalTapAction(299.9f, height))
+    }
+
+    @Test
+    fun webtoon_page_scroll_is_85_percent() {
+        assertEquals(0.85f, WEBTOON_PAGE_SCROLL)
+    }
+
     // --- keyAction ------------------------------------------------------------
 
     @Test

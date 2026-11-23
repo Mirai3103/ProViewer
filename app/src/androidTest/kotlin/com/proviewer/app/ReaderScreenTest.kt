@@ -3,12 +3,19 @@ package com.proviewer.app
 import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.graphics.Bitmap
+import android.graphics.Color as AndroidColor
 import android.net.Uri
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.test.junit4.createEmptyComposeRule
+import androidx.compose.ui.test.captureToImage
 import androidx.compose.ui.test.click
 import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.onRoot
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performSemanticsAction
 import androidx.compose.ui.test.performTouchInput
@@ -18,14 +25,31 @@ import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.proviewer.app.bench.CorpusGenerator
+import com.proviewer.app.engine.NativeBook
+import com.proviewer.app.open.OpenResult
 import com.proviewer.app.reader.FitMode
+import com.proviewer.app.reader.Layout
+import com.proviewer.app.reader.LayoutChoice
 import com.proviewer.app.reader.PageSlot
+import com.proviewer.app.reader.Part
+import com.proviewer.app.reader.ReaderAutomation
+import com.proviewer.app.reader.ReaderScreen
 import com.proviewer.app.reader.ReaderViewModel
+import com.proviewer.app.reader.SplitChoice
+import com.proviewer.app.reader.UnitPart
+import com.proviewer.app.reader.ZoomAutomation
 import com.proviewer.app.reader.baseSize
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -79,7 +103,7 @@ class ReaderScreenTest {
     }
 
     private fun readySize(vm: ReaderViewModel, page: Int): IntSize? =
-        (vm.window?.pages?.get(page) as? PageSlot.Ready)?.size
+        (vm.window?.slots?.get(UnitPart(page, Part.Whole)) as? PageSlot.Ready)?.size
 
     private fun waitReadySize(vm: ReaderViewModel, page: Int, expected: IntSize, timeout: Long = 30_000) {
         composeRule.waitUntil(timeout) { readySize(vm, page) == expected }
@@ -88,12 +112,12 @@ class ReaderScreenTest {
     private fun waitReady(vm: ReaderViewModel, page: Int): IntSize {
         val deadline = System.currentTimeMillis() + 30_000
         while (System.currentTimeMillis() < deadline) {
-            val slot = vm.window?.pages?.get(page)
+            val slot = vm.window?.slots?.get(UnitPart(page, Part.Whole))
             if (slot is PageSlot.Ready) return slot.size
             composeRule.waitForIdle()
             Thread.sleep(25)
         }
-        val slot = vm.window?.pages?.get(page)
+        val slot = vm.window?.slots?.get(UnitPart(page, Part.Whole))
         throw AssertionError("page $page never became Ready; slot=$slot, state=${vm.state}")
     }
 
@@ -240,6 +264,68 @@ class ReaderScreenTest {
     }
 
     @Test
+    fun overlay_controls_cycle() {
+        launch(mixedSmallUri()).use { scenario ->
+            val vm = grabVm(scenario)
+            awaitAttached(vm)
+            waitReady(vm, 0)
+
+            tapPage(0, 0.5f, 0.5f)
+            composeRule.waitUntil(10_000) { vm.state?.overlayVisible == true }
+
+            // In Single (mixed-small resolves to it: portrait, no strip, no wide pages) the
+            // split control is visible and shift is not.
+            composeRule.onNodeWithTag("reader-split").assertExists()
+            composeRule.onNodeWithTag("reader-shift").assertDoesNotExist()
+
+            // Layout cycles Auto -> Single -> TwoPage -> Webtoon -> Auto.
+            composeRule.onNodeWithTag("reader-layout").performClick()
+            composeRule.waitUntil(10_000) { vm.state?.layoutChoice == LayoutChoice.Single }
+            assertEquals(Layout.Single, vm.state!!.layout)
+
+            composeRule.onNodeWithTag("reader-layout").performClick()
+            composeRule.waitUntil(10_000) { vm.state?.layoutChoice == LayoutChoice.TwoPage }
+            assertEquals(Layout.TwoPage, vm.state!!.layout)
+            composeRule.waitForIdle()
+            composeRule.onNodeWithTag("reader-split").assertDoesNotExist()
+            composeRule.onNodeWithTag("reader-shift").assertExists()
+
+            composeRule.onNodeWithTag("reader-layout").performClick()
+            composeRule.waitUntil(10_000) { vm.state?.layoutChoice == LayoutChoice.Webtoon }
+            assertEquals(Layout.Webtoon, vm.state!!.layout)
+            composeRule.waitForIdle()
+            // Fit is hidden in Webtoon; shift is TwoPage-only.
+            composeRule.onNodeWithTag("reader-fit").assertDoesNotExist()
+            composeRule.onNodeWithTag("reader-shift").assertDoesNotExist()
+
+            composeRule.onNodeWithTag("reader-layout").performClick()
+            composeRule.waitUntil(10_000) { vm.state?.layoutChoice == LayoutChoice.Auto }
+            assertEquals("portrait Auto resolves Single", Layout.Single, vm.state!!.layout)
+            composeRule.waitForIdle()
+            composeRule.onNodeWithTag("reader-fit").assertExists()
+
+            // Split cycles Auto -> On -> Off (Single only).
+            composeRule.onNodeWithTag("reader-split").performClick()
+            composeRule.waitUntil(10_000) { vm.state?.split == SplitChoice.On }
+            composeRule.onNodeWithTag("reader-split").performClick()
+            composeRule.waitUntil(10_000) { vm.state?.split == SplitChoice.Off }
+            assertEquals(SplitChoice.Off, vm.state!!.split)
+
+            // Back to TwoPage: shift toggles the opening pair; a pair shows "n–m / total".
+            composeRule.onNodeWithTag("reader-layout").performClick() // Auto -> Single
+            composeRule.onNodeWithTag("reader-layout").performClick() // Single -> TwoPage
+            composeRule.waitUntil(10_000) { vm.state?.layout == Layout.TwoPage }
+            goTo(vm, 1) // the first pair
+            composeRule.waitUntil(10_000) { vm.state?.page == 1 && vm.state?.unit == 1 }
+            composeRule.onNodeWithText("2\u20133 / 20").assertExists()
+            composeRule.onNodeWithTag("reader-shift").performClick()
+            composeRule.waitUntil(10_000) {
+                vm.state?.shift == true && vm.units.firstOrNull()?.parts?.map { it.page } == listOf(0, 1)
+            }
+        }
+    }
+
+    @Test
     fun fit_mode_change_rerenders_base() {
         launch(mixedSmallUri()).use { scenario ->
             val vm = grabVm(scenario)
@@ -271,6 +357,48 @@ class ReaderScreenTest {
     }
 
     @Test
+    fun fit_width_tall_page_starts_at_origin_and_pans_to_bottom() {
+        // 1000x3000 -> fit width 1080x3240 (below the base caps, so display == size).
+        withOverflowReader("fit-width-tall.cbz", 1000, 3000, FitMode.Width) { base, zoom ->
+            assertBlocksMatch(
+                "top-left of the screen vs the base's top-left",
+                readBlock(composeRule.onRoot().captureToImage(), 0, 0),
+                baseBlock(base, 0, 0),
+            )
+
+            // Pan far past the bottom: the page's bottom edge must come to rest at the viewport's.
+            panAndSettle(zoom, Offset(0f, -10_000f))
+            val image = composeRule.onRoot().captureToImage()
+            assertBlocksMatch(
+                "bottom-left of the screen vs the base's bottom-left",
+                readBlock(image, 0, image.height - BLOCK),
+                baseBlock(base, 0, base.height - BLOCK),
+            )
+        }
+    }
+
+    @Test
+    fun fit_height_wide_page_starts_at_origin_and_pans_to_right() {
+        // 1600x1200 -> fit height 3171x2378 on the 1080x2378 viewport (not capped).
+        withOverflowReader("fit-height-wide.cbz", 1600, 1200, FitMode.Height) { base, zoom ->
+            assertBlocksMatch(
+                "top-left of the screen vs the base's top-left",
+                readBlock(composeRule.onRoot().captureToImage(), 0, 0),
+                baseBlock(base, 0, 0),
+            )
+
+            // Pan far past the right: the page's right edge must come to rest at the viewport's.
+            panAndSettle(zoom, Offset(-10_000f, 0f))
+            val image = composeRule.onRoot().captureToImage()
+            assertBlocksMatch(
+                "top-right of the screen vs the base's top-right",
+                readBlock(image, image.width - BLOCK, 0),
+                baseBlock(base, base.width - BLOCK, 0),
+            )
+        }
+    }
+
+    @Test
     fun corrupt_page_shows_placeholder_and_next_loads() {
         val cbz = buildCorruptCbz()
         launch(Uri.fromFile(cbz)).use { scenario ->
@@ -279,7 +407,31 @@ class ReaderScreenTest {
             waitReady(vm, 0)
 
             // The corrupt page (1) is rendered as a Failed slot in the prefetch window.
-            composeRule.waitUntil(10_000) { vm.window?.pages?.get(1) is PageSlot.Failed }
+            composeRule.waitUntil(10_000) { vm.window?.slots?.get(UnitPart(1, Part.Whole)) is PageSlot.Failed }
+
+            // Navigate to it: the placeholder must be shown.
+            goTo(vm, 1)
+            composeRule.waitUntil(10_000) { vm.state?.page == 1 }
+            composeRule.onNodeWithTag("reader-error-1").assertExists()
+
+            // The next page (2) still loads.
+            goTo(vm, 2)
+            waitReady(vm, 2)
+        }
+    }
+
+    @Test
+    fun probe_failed_page_shows_placeholder_and_next_loads() {
+        val cbz = buildProbeFailCbz()
+        launch(Uri.fromFile(cbz)).use { scenario ->
+            val vm = grabVm(scenario)
+            awaitAttached(vm)
+            waitReady(vm, 0)
+
+            // The size sweep fails on the header-broken page (1): no window target can be built
+            // for it, so the reader must fall back to the error placeholder, not a blank box.
+            composeRule.waitUntil(30_000) { vm.sizes?.failed(1) == true }
+            assertNull("a probe-failed page can never get a window slot", vm.window?.slots?.get(UnitPart(1, Part.Whole)))
 
             // Navigate to it: the placeholder must be shown.
             goTo(vm, 1)
@@ -298,6 +450,13 @@ class ReaderScreenTest {
             var vm = grabVm(scenario)
             awaitAttached(vm)
             waitReady(vm, 0)
+
+            // Pinned to Single (this test's Phase 2 whole-page semantics). The recycled-bitmap
+            // crash this pin used to hide is fixed and covered under Auto by TwoPageTest
+            // rotations_and_layout_cycles_never_draw_recycled_bitmaps; the pin stays because this
+            // test, run under Auto, hangs in roughly one run in four (a never-idle main looper,
+            // see docs/perf/phase3-reader.md, known follow-up) while 0 of 8 pinned runs did.
+            composeRule.runOnIdle { vm.setLayoutChoice(LayoutChoice.Single) }
 
             goTo(vm, 3)
             composeRule.waitUntil(10_000) { vm.state?.page == 3 }
@@ -336,6 +495,9 @@ class ReaderScreenTest {
         launch(Uri.fromFile(file)).use { scenario ->
             val vm = grabVm(scenario)
             awaitAttached(vm)
+            // Pin the layout this test assumes: it renders whole strip pages through the pager
+            // (auto-selection resolves this book to Webtoon, whose UI arrives in Task 10).
+            composeRule.runOnIdle { vm.setLayoutChoice(LayoutChoice.Single) }
             waitReady(vm, 0)
 
             // Switch to fit-width.
@@ -357,8 +519,15 @@ class ReaderScreenTest {
         launch(Uri.fromFile(file)).use { scenario ->
             val vm = grabVm(scenario)
 
-            // Wait only for attach (the render may still be in flight).
+            // Wait only for attach (the render may still be in flight). huge-single's page is
+            // wide: pin the layout this test assumes (Single; Auto would resolve it too, but the
+            // pin keeps that explicit) and Split Off so the whole-page unit is the one being
+            // rendered.
             composeRule.waitUntil(10_000) { vm.state != null }
+            composeRule.runOnIdle {
+                vm.setLayoutChoice(LayoutChoice.Single)
+                vm.setSplit(SplitChoice.Off)
+            }
             composeRule.onNodeWithTag("reader-root").assertExists()
 
             val book = vm.book!!
@@ -379,6 +548,160 @@ class ReaderScreenTest {
         }
     }
 
+    // --- fit overflow helpers ----------------------------------------------------
+
+    /**
+     * Opens a one-page CBZ whose single JPEG is [w] x [h] in a plain [ComponentActivity] hosting
+     * [ReaderScreen] (so the test can capture the [ReaderAutomation]), switches to [mode], waits
+     * until the base for the settled viewport is Ready, then runs [block] with the base bitmap
+     * (a software copy) and the page's [ZoomAutomation].
+     */
+    private fun withOverflowReader(
+        fileName: String,
+        w: Int,
+        h: Int,
+        mode: FitMode,
+        block: (base: Bitmap, zoom: ZoomAutomation) -> Unit,
+    ) {
+        val file = buildPatternCbz(fileName, w, h)
+        val app = context.applicationContext as ProViewerApp
+        val readerVm = ReaderViewModel()
+        val automation = CompletableDeferred<ReaderAutomation>()
+        val scenario = ActivityScenario.launch(ComponentActivity::class.java)
+        try {
+            scenario.onActivity { activity ->
+                activity.setContent {
+                    ReaderScreen(vm = readerVm, onBack = {}, onAutomation = { automation.complete(it) })
+                }
+            }
+            val book = NativeBook(app.engine.openPath(file.absolutePath), copiedFile = null)
+            composeRule.runOnIdle { readerVm.attach(OpenResult.Opened(book, file.name)) }
+            composeRule.waitUntil(60_000) { readerVm.state != null && readerVm.viewport != null }
+            composeRule.runOnIdle {
+                // fit-height-wide's page is wide: pin the layout this test assumes (Single; Auto
+                // would resolve it too) and Split Off, because this test reads the whole-page unit.
+                readerVm.setLayoutChoice(LayoutChoice.Single)
+                readerVm.setSplit(SplitChoice.Off)
+                readerVm.setFitMode(mode)
+            }
+
+            // Wait for the base of the settled viewport (the immersive-bars transition resizes the
+            // window shortly after composition): a stable viewport and a Ready slot of its size.
+            var lastViewport: IntSize? = null
+            var ready: PageSlot.Ready? = null
+            val deadline = System.currentTimeMillis() + 60_000
+            while (System.currentTimeMillis() < deadline && ready == null) {
+                composeRule.waitForIdle()
+                val view = readerVm.viewport!!
+                val slot = readerVm.window?.slots?.get(UnitPart(0, Part.Whole)) as? PageSlot.Ready
+                if (view == lastViewport && readerVm.state?.fitMode == mode && slot != null &&
+                    slot.size == baseSize(w, h, view.width, view.height, mode)
+                ) {
+                    ready = slot
+                }
+                lastViewport = view
+                if (ready == null) Thread.sleep(200)
+            }
+            val slot = checkNotNull(ready) {
+                "page never became Ready for $mode; viewport=$lastViewport " +
+                    "slot=${readerVm.window?.slots?.get(UnitPart(0, Part.Whole))}"
+            }
+            assertEquals("the fit must not be memory-capped for this test", slot.size, slot.display)
+            composeRule.waitForIdle()
+
+            val base = checkNotNull(slot.image.bitmap).copy(Bitmap.Config.ARGB_8888, false)
+            val readerAutomation = runBlocking { withTimeout(30_000) { automation.await() } }
+            var zoom: ZoomAutomation? = null
+            composeRule.waitUntil(30_000) {
+                zoom = readerAutomation.zoom
+                zoom != null
+            }
+            block(base, checkNotNull(zoom))
+        } finally {
+            scenario.close()
+            readerVm.release()
+        }
+    }
+
+    /** Pans by [delta] without animation and waits until the composition has drawn the result. */
+    private fun panAndSettle(zoom: ZoomAutomation, delta: Offset) {
+        // Dispatched from a main-thread scope and awaited by polling, so a pan that never
+        // completes fails the test with a message instead of blocking the instrumentation thread.
+        val failure = arrayOfNulls<Throwable>(1)
+        val job = CoroutineScope(Dispatchers.Main).launch {
+            try {
+                zoom.panBy(delta, animate = false)
+            } catch (e: Throwable) {
+                failure[0] = e
+            }
+        }
+        composeRule.waitUntil(15_000) { job.isCompleted }
+        failure[0]?.let { throw AssertionError("panBy failed", it) }
+        composeRule.waitForIdle()
+        Thread.sleep(300) // let the frame (and any detail render) settle
+        composeRule.waitForIdle()
+    }
+
+    private fun readBlock(image: ImageBitmap, x: Int, y: Int): IntArray {
+        val out = IntArray(BLOCK * BLOCK)
+        image.readPixels(out, startX = x, startY = y, width = BLOCK, height = BLOCK)
+        return out
+    }
+
+    private fun baseBlock(base: Bitmap, x: Int, y: Int): IntArray {
+        val out = IntArray(BLOCK * BLOCK)
+        base.getPixels(out, 0, BLOCK, x, y, BLOCK, BLOCK)
+        return out
+    }
+
+    /** Per-channel comparison of two packed ARGB blocks (screen vs base), tolerance [TOLERANCE]. */
+    private fun assertBlocksMatch(what: String, screen: IntArray, base: IntArray) {
+        for (i in screen.indices) {
+            val a = screen[i]
+            val b = base[i]
+            val diff = maxOf(
+                kotlin.math.abs(AndroidColor.red(a) - AndroidColor.red(b)),
+                kotlin.math.abs(AndroidColor.green(a) - AndroidColor.green(b)),
+                kotlin.math.abs(AndroidColor.blue(a) - AndroidColor.blue(b)),
+            )
+            if (diff > TOLERANCE) {
+                fail(
+                    "$what: pixel ${i % BLOCK},${i / BLOCK} differs by $diff " +
+                        "(screen=${Integer.toHexString(a)} base=${Integer.toHexString(b)})",
+                )
+            }
+        }
+    }
+
+    /**
+     * A one-page CBZ of a [w] x [h] JPEG made of 4 px cells with pseudo-random colours, so any
+     * placement offset of the drawn page shows up as a pixel mismatch in a small block.
+     */
+    private fun buildPatternCbz(name: String, w: Int, h: Int): File {
+        val dir = File(context.cacheDir, "reader-screen-corpus").apply { mkdirs() }
+        val file = File(dir, name)
+        val pixels = IntArray(w * h)
+        for (y in 0 until h) {
+            for (x in 0 until w) {
+                val cell = (x / 4) * 73856093 xor (y / 4) * 19349663
+                val v = (cell xor (cell ushr 13)) * 0x2545F491
+                pixels[y * w + x] = AndroidColor.rgb((v ushr 16) and 0xFF, (v ushr 8) and 0xFF, v and 0xFF)
+            }
+        }
+        val bitmap = Bitmap.createBitmap(pixels, w, h, Bitmap.Config.ARGB_8888)
+        val jpeg = ByteArrayOutputStream().also { bitmap.compress(Bitmap.CompressFormat.JPEG, 90, it) }.toByteArray()
+        bitmap.recycle()
+        ZipOutputStream(file.outputStream()).use { zip ->
+            zip.putNextEntry(ZipEntry("001.jpg")); zip.write(jpeg); zip.closeEntry()
+        }
+        return file
+    }
+
+    private companion object {
+        const val BLOCK = 8
+        const val TOLERANCE = 2
+    }
+
     // --- corrupt CBZ builder ---------------------------------------------------
 
     /** A CBZ with a valid `001.jpg`, a fatally-corrupt `002.jpg`, and a valid `003.jpg`. */
@@ -390,6 +713,20 @@ class ReaderScreenTest {
         ZipOutputStream(file.outputStream()).use { zip ->
             zip.putNextEntry(ZipEntry("001.jpg")); zip.write(valid); zip.closeEntry()
             zip.putNextEntry(ZipEntry("002.jpg")); zip.write(corrupt); zip.closeEntry()
+            zip.putNextEntry(ZipEntry("003.jpg")); zip.write(valid); zip.closeEntry()
+        }
+        return file
+    }
+
+    /** A CBZ with a valid `001.jpg`, a header-broken `002.jpg` (its size probe fails), and a valid `003.jpg`. */
+    private fun buildProbeFailCbz(): File {
+        val dir = File(context.cacheDir, "reader-screen-corpus").apply { mkdirs() }
+        val file = File(dir, "probe-fail.cbz")
+        val valid = validJpegBytes()
+        val headerBroken = ByteArray(64) // not an image: the size probe itself fails
+        ZipOutputStream(file.outputStream()).use { zip ->
+            zip.putNextEntry(ZipEntry("001.jpg")); zip.write(valid); zip.closeEntry()
+            zip.putNextEntry(ZipEntry("002.jpg")); zip.write(headerBroken); zip.closeEntry()
             zip.putNextEntry(ZipEntry("003.jpg")); zip.write(valid); zip.closeEntry()
         }
         return file

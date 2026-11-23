@@ -5,12 +5,14 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 /**
- * Benchmark report document (Task 9): one [BenchmarkResult] per run, serialized by [toJson] with
- * `schemaVersion: 1`. The JSON is the only exchange format between the benchmark runner (Task 10)
- * and post-processing tools, so every field is pinned by JVM tests.
+ * Benchmark report document (Tasks 9 + 12): one [BenchmarkResult] per run, serialized by [toJson]
+ * with `schemaVersion: 2`. The JSON is the only exchange format between the benchmark runner
+ * (Task 10) and post-processing tools, so every field is pinned by JVM tests. Schema 2 adds the
+ * a1 scenario and the two information-only Webtoon fields ([placeholderFrames],
+ * [peakImageBytes], null for every non-a1 scenario).
  */
 data class ScenarioResult(
-    val id: String, // "a2" | "a3-screentone" | "a3-huge" | "b"
+    val id: String, // "a1" | "a2" | "a3-screentone" | "a3-huge" | "b"
     val strategy: UploadStrategy,
     val order: Int,
     val refreshBeforeHz: Float,
@@ -21,6 +23,10 @@ data class ScenarioResult(
     val prefetched: LatencySummary?,
     val fellBackToSoftware: Boolean,
     val aborted: String?,
+    /** a1 only: frames that drew a placeholder in the Webtoon viewport's visible area. */
+    val placeholderFrames: Int? = null,
+    /** a1 only: the image budget's highest held bytes during the measurement window. */
+    val peakImageBytes: Long? = null,
 )
 
 data class BenchmarkResult(
@@ -31,10 +37,10 @@ data class BenchmarkResult(
     val scenarios: List<ScenarioResult>,
 )
 
-/** Serialize [r] into the schemaVersion-1 benchmark report JSON. */
+/** Serialize [r] into the schemaVersion-2 benchmark report JSON. */
 fun toJson(r: BenchmarkResult): String {
     val root = JSONObject()
-    root.put("schemaVersion", 1)
+    root.put("schemaVersion", 2)
     root.put("generator", CorpusGenerator.MARKER)
     root.put("validForPerformance", isValidForPerformance(r))
     root.put("conditions", conditionsJson(r.conditions))
@@ -81,6 +87,9 @@ private fun scenarioJson(s: ScenarioResult, maxRefreshHz: Float): JSONObject = J
     put("prefetched", s.prefetched?.let { latencyJson(it) } ?: JSONObject.NULL)
     put("fellBackToSoftware", s.fellBackToSoftware)
     put("aborted", s.aborted ?: JSONObject.NULL)
+    // a1's information-only fields (spec 6.6); JSON null for every other scenario.
+    put("placeholderFrames", s.placeholderFrames ?: JSONObject.NULL)
+    put("peakImageBytes", s.peakImageBytes ?: JSONObject.NULL)
     // Derived flags for the post-processing tools.
     put("rateChanged", s.refreshBeforeHz != s.refreshAfterHz)
     put("belowMaxRate", s.refreshBeforeHz < maxRefreshHz - 0.5)

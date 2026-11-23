@@ -76,15 +76,15 @@ fn harness_runs_on_generated_seeds() {
         harness::run_archive(&data);
         archives += 1;
     }
-    assert_eq!(archives, 5);
+    assert_eq!(archives, 6);
 
     let mut images = 0;
     for e in std::fs::read_dir(dir.path().join("decode")).unwrap() {
         harness::run_decode(&std::fs::read(e.unwrap().path()).unwrap());
         images += 1;
     }
-    // 35 extracted image entries plus the two damaged JPEG forms of the first seed.
-    assert_eq!(images, 37);
+    // 43 extracted image entries (35 + the 8 of two-page.cbz) plus the two damaged JPEG forms of the first seed.
+    assert_eq!(images, 45);
 }
 
 /// Truncations and bit flips of valid seeds (what libFuzzer does first) must never panic or hang.

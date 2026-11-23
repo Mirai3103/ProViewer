@@ -3,8 +3,8 @@ mod common;
 use proviewer_core::archive::open_path;
 use proviewer_core::decode::{supported_denoms, ImageFormat, PageInfo};
 use proviewer_core::engine::{
-    default_engine_config, fit_size, Book, CancelToken, Engine, EngineConfig, ReadDirection,
-    TileRequest,
+    default_engine_config, fit_size, fit_size_for, Book, CancelToken, Engine, EngineConfig,
+    FitTarget, ReadDirection, ScaledTileRequest, TileRequest,
 };
 use proviewer_core::error::EngineError;
 use proviewer_core::limits::Limits;
@@ -175,6 +175,46 @@ fn fit_size_table() {
     assert_eq!(fit_size(1600, 2400, VIEW_W, VIEW_H), (1080, 1620));
     assert_eq!(fit_size(800, 24000, VIEW_W, VIEW_H), (79, 2378));
     assert_eq!(fit_size(3200, 2400, VIEW_W, VIEW_H), (1080, 810));
+}
+
+#[test]
+fn fit_size_for_table() {
+    // Screen is fit_size; Width/Height scale to that edge and may overflow the other one.
+    assert_eq!(
+        fit_size_for(1600, 2400, VIEW_W, VIEW_H, FitTarget::Screen),
+        (1080, 1620)
+    );
+    assert_eq!(
+        fit_size_for(800, 24000, VIEW_W, VIEW_H, FitTarget::Screen),
+        (79, 2378)
+    );
+    assert_eq!(
+        fit_size_for(800, 24000, VIEW_W, VIEW_H, FitTarget::Width),
+        (1080, 32400)
+    );
+    assert_eq!(
+        fit_size_for(400, 12000, 540, 1189, FitTarget::Width),
+        (540, 16200)
+    );
+    assert_eq!(
+        fit_size_for(3200, 2400, VIEW_W, VIEW_H, FitTarget::Height),
+        (3171, 2378)
+    );
+    assert_eq!(
+        fit_size_for(1600, 2400, VIEW_W, VIEW_H, FitTarget::Height),
+        (1585, 2378)
+    );
+    // at least 1 in each dimension
+    assert_eq!(
+        fit_size_for(100_000, 1, 1080, 2378, FitTarget::Width),
+        (1080, 1)
+    );
+    assert_eq!(
+        fit_size_for(1, 100_000, 1080, 2378, FitTarget::Height),
+        (1, 2378)
+    );
+    let (w, h) = fit_size_for(0, 0, 0, 0, FitTarget::Width);
+    assert!(w >= 1 && h >= 1);
 }
 
 #[test]
@@ -450,7 +490,7 @@ fn cancel_token_clones_share_state() {
 fn prefetch_warms_next_pages() {
     let engine = engine();
     let book = open(&engine, "mixed-small.cbz");
-    book.prefetch_hint(0, ReadDirection::Forward, VIEW_W, VIEW_H);
+    book.prefetch_hint(0, ReadDirection::Forward, VIEW_W, VIEW_H, FitTarget::Screen);
     wait_until("3 prefetched pages", || engine.stats().cache_entries >= 3);
     wait_prefetch_idle(&engine);
     let before = engine.stats();
@@ -470,7 +510,13 @@ fn prefetch_backward_warms_previous_pages() {
         ..EngineConfig::default()
     });
     let book = open(&engine, "mixed-small.cbz");
-    book.prefetch_hint(10, ReadDirection::Backward, VIEW_W, VIEW_H);
+    book.prefetch_hint(
+        10,
+        ReadDirection::Backward,
+        VIEW_W,
+        VIEW_H,
+        FitTarget::Screen,
+    );
     wait_prefetch_idle(&engine);
     assert_eq!(engine.stats().cache_entries, 3);
     for page in [9, 8, 11] {
@@ -487,7 +533,7 @@ fn render_during_prefetch_does_not_double_decode() {
         ..EngineConfig::default()
     });
     let book = open(&engine, "mixed-small.cbz");
-    book.prefetch_hint(0, ReadDirection::Forward, VIEW_W, VIEW_H);
+    book.prefetch_hint(0, ReadDirection::Forward, VIEW_W, VIEW_H, FitTarget::Screen);
     render_fit(&book, 1);
     wait_prefetch_idle(&engine);
     assert_eq!(book.page_decode_count(1), 1);
@@ -508,7 +554,7 @@ fn render_waits_for_the_running_prefetch_decode() {
     });
     let book = open(&engine, "mixed-small.cbz");
     let gate = Gate::install(&engine, 1);
-    book.prefetch_hint(0, ReadDirection::Forward, VIEW_W, VIEW_H);
+    book.prefetch_hint(0, ReadDirection::Forward, VIEW_W, VIEW_H, FitTarget::Screen);
     gate.wait_entered();
     std::thread::scope(|s| {
         let render = s.spawn(|| render_fit(&book, 1));
@@ -538,7 +584,7 @@ fn cancelled_prefetch_does_not_poison_foreground_render() {
     });
     let book = open(&engine, "mixed-small.cbz");
     let gate = Gate::install(&engine, 1);
-    book.prefetch_hint(0, ReadDirection::Forward, VIEW_W, VIEW_H);
+    book.prefetch_hint(0, ReadDirection::Forward, VIEW_W, VIEW_H, FitTarget::Screen);
     gate.wait_entered();
     book.cancel_prefetch();
     std::thread::scope(|s| {
@@ -573,9 +619,9 @@ fn stale_prefetch_jobs_do_no_work() {
     });
     let book = open(&engine, "mixed-small.cbz");
     let gate = Gate::install(&engine, 1);
-    book.prefetch_hint(0, ReadDirection::Forward, VIEW_W, VIEW_H);
+    book.prefetch_hint(0, ReadDirection::Forward, VIEW_W, VIEW_H, FitTarget::Screen);
     gate.wait_entered();
-    book.prefetch_hint(5, ReadDirection::Forward, VIEW_W, VIEW_H);
+    book.prefetch_hint(5, ReadDirection::Forward, VIEW_W, VIEW_H, FitTarget::Screen);
     book.cancel_prefetch();
     gate.open();
     wait_prefetch_idle(&engine);
@@ -593,10 +639,16 @@ fn newer_hint_supersedes_older_one() {
     });
     let book = open(&engine, "mixed-small.cbz");
     let gate = Gate::install(&engine, 1);
-    book.prefetch_hint(0, ReadDirection::Forward, VIEW_W, VIEW_H);
+    book.prefetch_hint(0, ReadDirection::Forward, VIEW_W, VIEW_H, FitTarget::Screen);
     gate.wait_entered();
-    book.prefetch_hint(5, ReadDirection::Forward, VIEW_W, VIEW_H); // queued behind the parked job
-    book.prefetch_hint(10, ReadDirection::Forward, VIEW_W, VIEW_H);
+    book.prefetch_hint(5, ReadDirection::Forward, VIEW_W, VIEW_H, FitTarget::Screen); // queued behind the parked job
+    book.prefetch_hint(
+        10,
+        ReadDirection::Forward,
+        VIEW_W,
+        VIEW_H,
+        FitTarget::Screen,
+    );
     gate.open();
     wait_prefetch_idle(&engine);
     assert_eq!(book.page_decode_count(6), 0, "older hint must be stale");
@@ -684,7 +736,7 @@ fn dropping_book_during_prefetch_decode_leaves_cache_empty() {
     });
     let book = open(&engine, "mixed-small.cbz");
     let gate = Gate::install(&engine, 1);
-    book.prefetch_hint(0, ReadDirection::Forward, VIEW_W, VIEW_H);
+    book.prefetch_hint(0, ReadDirection::Forward, VIEW_W, VIEW_H, FitTarget::Screen);
     gate.wait_entered();
     drop(book);
     gate.open();
@@ -703,7 +755,7 @@ fn queued_prefetch_of_dropped_book_does_nothing() {
     });
     let book = open(&engine, "mixed-small.cbz");
     let gate = Gate::install(&engine, 1);
-    book.prefetch_hint(0, ReadDirection::Forward, VIEW_W, VIEW_H);
+    book.prefetch_hint(0, ReadDirection::Forward, VIEW_W, VIEW_H, FitTarget::Screen);
     gate.wait_entered(); // page 1 running; pages 2 and 3 queued
     drop(book);
     gate.open();
@@ -829,6 +881,149 @@ fn render_into_padded_stride_leaves_padding_untouched() {
             );
         }
     }
+}
+
+fn render_scaled(book: &Book, req: &ScaledTileRequest) -> Vec<u8> {
+    let stride = req.out_width as usize * 4;
+    let mut dst = vec![0u8; stride * req.out_height as usize];
+    book.render_scaled_tile(req, &mut dst, stride, &CancelToken::new())
+        .unwrap();
+    dst
+}
+
+#[test]
+fn scaled_whole_tile_equals_render_tile() {
+    let engine = engine();
+    let book = open(&engine, "mixed-small.cbz");
+    let info = book.page_info(0).unwrap();
+    let fit = fit_request(&book, 0);
+    // fit size (decimated decode), the natural size (identity path) and an upscale
+    for (w, h) in [
+        (fit.out_width, fit.out_height),
+        (info.width, info.height),
+        (info.width * 3 / 2, info.height * 3 / 2),
+    ] {
+        let req = ScaledTileRequest {
+            page: 0,
+            full_width: w,
+            full_height: h,
+            out_x: 0,
+            out_y: 0,
+            out_width: w,
+            out_height: h,
+        };
+        assert!(
+            render_scaled(&book, &req) == render_full(&book, 0, w, h),
+            "{w}x{h}: scaled whole tile differs from render_tile"
+        );
+    }
+}
+
+#[test]
+fn scaled_tile_rejects_bad_requests() {
+    let engine = engine();
+    let book = open(&engine, "mixed-small.cbz");
+    let ok = ScaledTileRequest {
+        page: 0,
+        full_width: 100,
+        full_height: 150,
+        out_x: 10,
+        out_y: 20,
+        out_width: 30,
+        out_height: 40,
+    };
+    let cases = [
+        ScaledTileRequest { out_width: 0, ..ok },
+        ScaledTileRequest {
+            out_height: 0,
+            ..ok
+        },
+        ScaledTileRequest {
+            full_width: 0,
+            ..ok
+        },
+        ScaledTileRequest { out_x: 71, ..ok },
+        ScaledTileRequest {
+            out_y: u32::MAX,
+            ..ok
+        },
+        ScaledTileRequest {
+            full_height: proviewer_core::resize::MAX_SCALED_FULL_DIM + 1,
+            ..ok
+        },
+    ];
+    let mut dst = vec![0u8; 30 * 40 * 4];
+    for req in cases {
+        let r = book.render_scaled_tile(&req, &mut dst, 30 * 4, &CancelToken::new());
+        assert!(
+            matches!(r, Err(EngineError::InvalidRequest { .. })),
+            "{req:?}: {r:?}"
+        );
+    }
+    // stride and buffer length are validated like render_tile
+    let r = book.render_scaled_tile(&ok, &mut dst, 30 * 4 - 1, &CancelToken::new());
+    assert!(
+        matches!(r, Err(EngineError::InvalidRequest { .. })),
+        "{r:?}"
+    );
+    let mut short = vec![0u8; 30 * 40 * 4 - 1];
+    let r = book.render_scaled_tile(&ok, &mut short, 30 * 4, &CancelToken::new());
+    assert!(
+        matches!(r, Err(EngineError::InvalidRequest { .. })),
+        "{r:?}"
+    );
+    // a bad page is reported before anything is decoded
+    let r = book.render_scaled_tile(
+        &ScaledTileRequest { page: 999, ..ok },
+        &mut dst,
+        120,
+        &CancelToken::new(),
+    );
+    assert!(
+        matches!(r, Err(EngineError::PageOutOfRange { .. })),
+        "{r:?}"
+    );
+    assert_eq!(engine.stats().decodes, 0);
+    book.render_scaled_tile(&ok, &mut dst, 30 * 4, &CancelToken::new())
+        .unwrap();
+}
+
+/// A two-page CBZ of 400x12000 JPEG webtoon strips (8.7 MP each at fit width 540).
+fn strip_book(engine: &Engine, dir: &std::path::Path) -> Arc<Book> {
+    let img = gen_corpus::webtoon_strip(400, 12000);
+    let mut jpeg = Vec::new();
+    jpeg_encoder::Encoder::new(&mut jpeg, 90)
+        .encode(img.as_raw(), 400, 12000, jpeg_encoder::ColorType::Luma)
+        .unwrap();
+    let cbz = dir.join("strips.cbz");
+    write_cbz(&cbz, &[("1.jpg", jpeg.clone()), ("2.jpg", jpeg)]);
+    engine.open_path(cbz.to_str().unwrap().to_string()).unwrap()
+}
+
+/// Hints page 0 with `fit` for a 540x1189 viewport, waits for prefetch, renders page 1 at fit width and
+/// returns how many times page 1 was decoded.
+fn decodes_after_width_render(fit: FitTarget) -> u64 {
+    let engine = engine();
+    let dir = tempfile::tempdir().unwrap();
+    let book = strip_book(&engine, dir.path());
+    book.prefetch_hint(0, ReadDirection::Forward, 540, 1189, fit);
+    wait_prefetch_idle(&engine);
+    assert_eq!(book.page_decode_count(1), 1, "page 1 was prefetched");
+    let (w, h) = fit_size_for(400, 12000, 540, 1189, FitTarget::Width);
+    assert_eq!((w, h), (540, 16200));
+    render_full(&book, 1, w, h);
+    book.page_decode_count(1)
+}
+
+#[test]
+fn prefetch_width_fit_warms_full_decode() {
+    assert_eq!(decodes_after_width_render(FitTarget::Width), 1);
+}
+
+#[test]
+fn prefetch_screen_fit_does_not_warm_width() {
+    // Control: a screen-fit hint warms the 1/8 decode, so the fit-width render decodes again.
+    assert_eq!(decodes_after_width_render(FitTarget::Screen), 2);
 }
 
 #[test]

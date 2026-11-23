@@ -9,6 +9,7 @@ import androidx.compose.ui.test.doubleClick
 import androidx.compose.ui.test.junit4.v2.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performTouchInput
+import androidx.compose.ui.test.swipe
 import androidx.compose.ui.test.swipeLeft
 import androidx.compose.ui.unit.IntSize
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -20,10 +21,14 @@ import com.proviewer.app.reader.FitMode
 import com.proviewer.app.reader.LocalReaderProbe
 import com.proviewer.app.reader.PageRegion
 import com.proviewer.app.reader.PageSlot
+import com.proviewer.app.reader.Part
 import com.proviewer.app.reader.ReaderAutomation
 import com.proviewer.app.reader.ReaderProbe
 import com.proviewer.app.reader.ReaderScreen
 import com.proviewer.app.reader.ReaderViewModel
+import com.proviewer.app.reader.LayoutChoice
+import com.proviewer.app.reader.SplitChoice
+import com.proviewer.app.reader.UnitPart
 import com.proviewer.app.reader.ZoomAutomation
 import com.proviewer.app.reader.baseSize
 import com.proviewer.app.reader.visibleRegion
@@ -142,7 +147,7 @@ class ZoomTest {
         while (System.currentTimeMillis() < deadline) {
             composeRule.waitForIdle()
             val view = readerVm.viewport!!
-            val ready = (readerVm.window?.pages?.get(page) as? PageSlot.Ready)?.size
+            val ready = (readerVm.window?.slots?.get(UnitPart(page, Part.Whole)) as? PageSlot.Ready)?.size
             if (view == lastViewport && ready == baseSize(pageW, pageH, view.width, view.height, FitMode.Screen)) {
                 return checkNotNull(ready)
             }
@@ -150,7 +155,8 @@ class ZoomTest {
             Thread.sleep(200)
         }
         throw AssertionError(
-            "page $page never settled; viewport=$lastViewport slot=${readerVm.window?.pages?.get(page)}",
+            "page $page never settled; viewport=$lastViewport " +
+                "slot=${readerVm.window?.slots?.get(UnitPart(page, Part.Whole))}",
         )
     }
 
@@ -167,7 +173,7 @@ class ZoomTest {
         contentLeft: Float,
         contentTop: Float,
     ): PageRegion {
-        val slot = readerVm.window!!.pages[page] as PageSlot.Ready
+        val slot = readerVm.window!!.slots.getValue(UnitPart(page, Part.Whole)) as PageSlot.Ready
         val info = readerVm.book!!.pageInfo(page)
         val view = readerVm.viewport!!
         return checkNotNull(
@@ -330,16 +336,58 @@ class ZoomTest {
     }
 
     @Test
+    fun zoomed_pan_to_edge_in_one_drag_does_not_turn() {
+        val probe = RecordingProbe()
+        val readerVm = launchReader(corpusFile("screentone.cbz"), probe)
+        awaitReadyAndSettled(readerVm)
+        val zoom = zoomAutomation()
+        val pageW = readerVm.book!!.pageInfo(0).width.toInt()
+
+        // Zoom to 2x at the centre and let the centred detail settle: the content now overflows
+        // the viewport by about 540 px on each side.
+        mainScope.launch { zoom.zoomTo(2f, viewportCentre(readerVm), animate = false) }
+        composeRule.waitUntil(20_000) { probe.eventCount("done") == 1 }
+
+        // ONE drag of about 920 px, more than the pan room to the right edge: the part past the
+        // edge must be absorbed, never handed to the pager within the same gesture.
+        composeRule.onNodeWithTag("reader-page-0").performTouchInput {
+            swipe(
+                start = Offset(0.9f * width, centerY),
+                end = Offset(0.05f * width, centerY),
+                durationMillis = 400,
+            )
+        }
+        composeRule.waitForIdle()
+
+        // The panned view settled: its detail render touches the page's right edge.
+        composeRule.waitUntil(20_000) {
+            probe.images().any { it != null && it.x + it.w == pageW }
+        }
+        // Give a (wrongly) started pager turn time to settle before asserting it did not happen.
+        Thread.sleep(1_000)
+        composeRule.waitForIdle()
+        assertNoScopeErrors()
+        assertEquals("one drag must pan to the edge, not turn the page", 0, readerVm.state!!.page)
+    }
+
+    @Test
     fun max_zoom_reaches_source_pixels() {
         val probe = RecordingProbe()
         val readerVm = launchReader(corpusFile("huge-single.cbz"), probe)
+        // huge-single's one page is wide (12000x8000): pin the layout this test assumes (Single;
+        // Auto would resolve it too, but the pin keeps that explicit) and Split Off, because
+        // this test reads the whole-page unit.
+        composeRule.runOnIdle {
+            readerVm.setLayoutChoice(LayoutChoice.Single)
+            readerVm.setSplit(SplitChoice.Off)
+        }
         awaitReadyAndSettled(readerVm)
         val zoom = zoomAutomation()
 
         val info = readerVm.book!!.pageInfo(0)
         val pageW = info.width.toInt()
         val pageH = info.height.toInt()
-        val base = (readerVm.window!!.pages[0] as PageSlot.Ready).size
+        val base = (readerVm.window!!.slots.getValue(UnitPart(0, Part.Whole)) as PageSlot.Ready).size
         val maxZoom = max(4f, pageW / base.width.toFloat())
 
         // Zoom far past the limit; the state coerces to the spec maximum.

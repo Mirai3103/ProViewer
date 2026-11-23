@@ -45,13 +45,17 @@ import androidx.compose.ui.unit.dp
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import com.proviewer.app.reader.webtoon.WebtoonViewport
 import kotlinx.coroutines.flow.distinctUntilChanged
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.roundToInt
 
 /**
- * The single-page reader: an LTR/RTL [HorizontalPager], full-screen tap zones, an overlay with the
- * title, back button, page slider and direction/fit toggles, and immersive system bars.
+ * The paged reader over [ReaderUnit]s (spec 6.5): an LTR/RTL [HorizontalPager] whose pages are
+ * the book's units (a whole page, a split half or a two-page spread), full-screen tap zones, an
+ * overlay with the title, back button, page slider, the layout/split/shift controls (spec 5.1's
+ * manual override) and the direction/fit toggles, and immersive system bars. Slider and label
+ * keep working on book pages ("n / total", "n–m / total" for a Two-page pair).
  */
 @Composable
 fun ReaderScreen(
@@ -79,11 +83,11 @@ fun ReaderScreen(
         }
     }
 
-    val pagerState = rememberPagerState(initialPage = state.page, pageCount = { state.count })
+    val pagerState = rememberPagerState(initialPage = state.unit, pageCount = { vm.units.size })
 
     // True from the start of a user drag on the pager until its scroll settles. Only such a
     // scroll may move the ViewModel: a programmatic animation that is interrupted by the next one
-    // (two quick volume presses) briefly reports "not scrolling" at an intermediate page, and
+    // (two quick volume presses) briefly reports "not scrolling" at an intermediate unit, and
     // reporting that would snap the reader back to it.
     val userScroll = remember { AtomicBoolean(false) }
     LaunchedEffect(pagerState) {
@@ -92,39 +96,51 @@ fun ReaderScreen(
         }
     }
 
-    // ViewModel -> pager: animate to the logical page when it changes (tap zones, volume keys,
+    // ViewModel -> pager: animate to the current unit when it changes (tap zones, volume keys,
     // slider, automation). Skipped when the pager is already there (a settle from a user swipe).
-    LaunchedEffect(state.page) {
-        if (pagerState.currentPage != state.page) {
+    // When the units were rebuilt (a size batch adding splits or changing pairings before the
+    // page, a layout/split/shift/direction change) the book page did not move — only its index —
+    // so the pager snaps there instead of sliding through other units.
+    val shownUnits = remember { arrayOfNulls<List<ReaderUnit>>(1) }
+    val units = vm.units
+    LaunchedEffect(state.unit, units) {
+        val rebuilt = shownUnits[0] != null && shownUnits[0] !== units
+        shownUnits[0] = units
+        if (pagerState.currentPage != state.unit) {
             userScroll.set(false) // the VM now owns the target; a leftover fling must not report
-            pagerState.animateScrollToPage(state.page)
+            if (rebuilt) pagerState.scrollToPage(state.unit) else pagerState.animateScrollToPage(state.unit)
         }
     }
 
-    // Pager -> ViewModel: report the settled page after a user swipe, but not the intermediate
-    // pages a fling or a programmatic animation passes through.
+    // Pager -> ViewModel: report the settled unit after a user swipe, but not the intermediate
+    // units a fling or a programmatic animation passes through.
     LaunchedEffect(pagerState) {
         snapshotFlow { pagerState.currentPage to pagerState.isScrollInProgress }
             .distinctUntilChanged()
-            .collect { (page, inProgress) ->
-                if (!inProgress) vm.onPageSettled(page, fromUser = userScroll.getAndSet(false))
+            .collect { (unit, inProgress) ->
+                if (!inProgress) vm.onUnitSettled(unit, fromUser = userScroll.getAndSet(false))
             }
     }
 
-    // Each rendered page publishes its ZoomablePage automation; the current page's is exposed.
-    val pageZooms = remember { mutableStateMapOf<Int, ZoomAutomation>() }
+    // Each rendered unit publishes its ZoomableUnit automation; the current unit's is exposed.
+    val unitZooms = remember { mutableStateMapOf<Int, ZoomAutomation>() }
+    // The Webtoon viewport publishes its automation while it exists (null once it is disposed).
+    val webtoonAutomation = remember { mutableStateOf<WebtoonAutomation?>(null) }
     val automation = remember(vm, pagerState) {
         object : ReaderAutomation {
             override suspend fun turnTo(page: Int, animate: Boolean) {
                 vm.goTo(page)
-                if (animate) pagerState.animateScrollToPage(page) else pagerState.scrollToPage(page)
+                val unit = vm.state?.unit ?: return
+                if (animate) pagerState.animateScrollToPage(unit) else pagerState.scrollToPage(unit)
             }
 
             override suspend fun awaitIdle() {
                 vm.window?.awaitIdle()
             }
 
-            override val zoom: ZoomAutomation? get() = pageZooms[vm.state?.page]
+            override val zoom: ZoomAutomation? get() = unitZooms[vm.state?.unit]
+
+            override val webtoon: WebtoonAutomation? get() = webtoonAutomation.value
         }
     }
     LaunchedEffect(automation) { onAutomation(automation) }
@@ -138,21 +154,32 @@ fun ReaderScreen(
             .background(Color.Black)
             .onSizeChanged { vm.onViewport(it.width, it.height) },
     ) {
-        HorizontalPager(
-            state = pagerState,
-            reverseLayout = state.direction == Direction.Rtl,
-            beyondViewportPageCount = 1,
-            modifier = Modifier.fillMaxSize(),
-        ) { page ->
-            PageSlotView(
-                page = page,
+        if (state.layout == Layout.Webtoon && vm.webtoon != null) {
+            // Webtoon: one self-drawn viewport instead of the pager (whose window is closed).
+            WebtoonViewport(
                 vm = vm,
-                direction = state.direction,
+                session = vm.webtoon!!,
                 probe = probe,
-                onZoom = { zoomAutomation ->
-                    if (zoomAutomation == null) pageZooms.remove(page) else pageZooms[page] = zoomAutomation
-                },
+                onAutomation = { webtoonAutomation.value = it },
             )
+        } else {
+            HorizontalPager(
+                state = pagerState,
+                reverseLayout = state.direction == Direction.Rtl,
+                beyondViewportPageCount = 1,
+                modifier = Modifier.fillMaxSize(),
+            ) { unitIndex ->
+                UnitSlotView(
+                    unitIndex = unitIndex,
+                    vm = vm,
+                    direction = state.direction,
+                    fitMode = state.fitMode,
+                    probe = probe,
+                    onZoom = { zoomAutomation ->
+                        if (zoomAutomation == null) unitZooms.remove(unitIndex) else unitZooms[unitIndex] = zoomAutomation
+                    },
+                )
+            }
         }
 
         if (state.overlayVisible) {
@@ -162,19 +189,36 @@ fun ReaderScreen(
 }
 
 @Composable
-private fun PageSlotView(
-    page: Int,
+private fun UnitSlotView(
+    unitIndex: Int,
     vm: ReaderViewModel,
     direction: Direction,
+    fitMode: FitMode,
     probe: ReaderProbe,
     onZoom: (ZoomAutomation?) -> Unit,
 ) {
-    val slot = vm.window?.pages?.get(page)
-    val slotSize = remember { mutableStateOf(IntSize.Zero) }
+    val state = vm.state ?: return
+    val unit = vm.units.getOrNull(unitIndex)
+    val viewport = vm.viewport
+    val renderer = vm.renderer
+    val budget = vm.budget
+    val sizes = vm.sizes
+
+    // Read the snapshot-tracked inputs before the geometry branch: the size prober's maps and the
+    // viewport are not snapshot state, so this composable must subscribe to the window's slots
+    // and the prober's version to recompose once they land (otherwise a unit whose page sizes
+    // were unknown at the first composition would stay a placeholder forever).
+    val slotMap: Map<UnitPart, PageSlot> =
+        unit?.parts?.associateWith { part -> vm.window?.slots?.get(part) ?: PageSlot.Loading } ?: emptyMap()
+    // Subscription read: `version` is snapshot state while the size maps are not; its value is
+    // not used beyond triggering this recomposition.
+    sizes?.version
+
     // Telephoto 0.19.0 captures zoomable's onClick once (its tap node only swaps the handler when
     // the parameter's nullability flips), so the handler must resolve the live values itself
     // instead of capturing this recomposition's direction and size.
-    val onSlotTap: (Offset) -> Unit = remember(vm) {
+    val slotSize = remember { mutableStateOf(IntSize.Zero) }
+    val onUnitTap: (Offset) -> Unit = remember(vm) {
         { offset: Offset ->
             when (tapAction(offset.x, slotSize.value.width.toFloat(), vm.state?.direction ?: Direction.Ltr)) {
                 TapAction.Previous -> vm.previous()
@@ -183,40 +227,71 @@ private fun PageSlotView(
             }
         }
     }
+
+    val geometry = if (unit != null && viewport != null) {
+        unitGeometry(
+            unit = unit,
+            sizeOf = { page -> sizes?.known(page) ?: renderer?.knownPageSize(page) },
+            viewW = viewport.width,
+            viewH = viewport.height,
+            mode = fitMode,
+            direction = direction,
+        )
+    } else {
+        null
+    }
+
     Box(
         Modifier
             .fillMaxSize()
-            .testTag("reader-page-$page")
+            // The pager page is the unit; in Single without split it is the book page itself.
+            .testTag("reader-page-$unitIndex")
             .onSizeChanged { slotSize.value = it }
             .then(
-                if (slot is PageSlot.Ready) {
-                    // The rendered page handles taps through its zoomable gestures.
+                if (geometry != null) {
+                    // The rendered unit handles taps through its zoomable gestures.
                     Modifier
                 } else {
-                    Modifier.pointerInput(direction) { detectTapGestures(onTap = onSlotTap) }
+                    Modifier.pointerInput(direction) { detectTapGestures(onTap = onUnitTap) }
                 },
             ),
     ) {
-        when (slot) {
-            is PageSlot.Ready -> {
-                val renderer = vm.renderer
-                val state = vm.state
-                val naturalSize = renderer?.knownPageSize(page) // known: the page rendered
-                if (renderer != null && state != null && naturalSize != null) {
-                    ZoomablePage(
-                        page = page,
-                        slot = slot,
-                        pageSize = naturalSize,
-                        renderer = renderer,
-                        probe = probe,
-                        mode = state.fitMode,
-                        onTap = onSlotTap,
-                        onZoom = onZoom,
-                    )
+        if (unit != null && geometry != null && renderer != null && budget != null) {
+            ZoomableUnit(
+                unitIndex = unitIndex,
+                geometry = geometry,
+                slots = slotMap,
+                renderer = renderer,
+                budget = budget,
+                probe = probe,
+                isCurrent = unitIndex == state.unit,
+                mode = fitMode,
+                onTap = onUnitTap,
+                onZoom = onZoom,
+            )
+        } else if (unit != null) {
+            // No geometry: at least one part's page size is unknown (not probed yet, or its size
+            // probe failed). Probe-failed parts never get a window target, so they would
+            // otherwise render as a blank box: show the error placeholder for them.
+            RowFillPlaceholders(unit, sizes)
+        } else {
+            Box(Modifier.fillMaxSize().background(Color(0xFF111111)))
+        }
+    }
+}
+
+/** Whole-slot placeholders for a unit whose geometry is unknown (a part's size is unknown). */
+@Composable
+private fun RowFillPlaceholders(unit: ReaderUnit, sizes: PageSizes?) {
+    Row(Modifier.fillMaxSize()) {
+        for (part in unit.parts) {
+            Box(Modifier.weight(1f).fillMaxSize()) {
+                if (sizes?.failed(part.page) == true) {
+                    ErrorSlot(part.page, "size probe failed")
+                } else {
+                    Box(Modifier.fillMaxSize().background(Color(0xFF111111)))
                 }
             }
-            is PageSlot.Failed -> ErrorSlot(page, slot.reason)
-            else -> Box(Modifier.fillMaxSize().background(Color(0xFF111111)))
         }
     }
 }
@@ -253,7 +328,7 @@ private fun ReaderOverlay(state: ReaderState, vm: ReaderViewModel, onBack: () ->
         // and toggles the overlay back off.
         Spacer(Modifier.weight(1f))
 
-        // Bottom controls (slider + n/total + direction and fit toggles).
+        // Bottom controls (slider + page label + layout/split/shift, then direction/fit toggles).
         Column(Modifier.fillMaxWidth().background(Color(0xCC000000)).padding(16.dp)) {
             var sliderValue by remember(state.page) { mutableFloatStateOf(state.page.toFloat()) }
             Slider(
@@ -263,7 +338,31 @@ private fun ReaderOverlay(state: ReaderState, vm: ReaderViewModel, onBack: () ->
                 valueRange = 0f..(state.count - 1).coerceAtLeast(1).toFloat(),
                 modifier = Modifier.testTag("reader-slider"),
             )
-            Text("${state.page + 1} / ${state.count}", color = Color.White)
+            Text(pageLabel(state, vm.units), color = Color.White)
+            Row {
+                TextButton(
+                    onClick = { vm.setLayoutChoice(nextLayoutChoice(state.layoutChoice)) },
+                    modifier = Modifier.testTag("reader-layout"),
+                ) {
+                    Text(state.layoutChoice.name, color = Color.White)
+                }
+                if (state.layout == Layout.Single) {
+                    TextButton(
+                        onClick = { vm.setSplit(nextSplitChoice(state.split)) },
+                        modifier = Modifier.testTag("reader-split"),
+                    ) {
+                        Text(state.split.name, color = Color.White)
+                    }
+                }
+                if (state.layout == Layout.TwoPage) {
+                    TextButton(
+                        onClick = { vm.setShift(!state.shift) },
+                        modifier = Modifier.testTag("reader-shift"),
+                    ) {
+                        Text(if (state.shift) "Shift On" else "Shift Off", color = Color.White)
+                    }
+                }
+            }
             Row {
                 TextButton(
                     onClick = {
@@ -273,15 +372,46 @@ private fun ReaderOverlay(state: ReaderState, vm: ReaderViewModel, onBack: () ->
                 ) {
                     Text(if (state.direction == Direction.Ltr) "LTR" else "RTL", color = Color.White)
                 }
-                TextButton(
-                    onClick = { vm.setFitMode(nextFitMode(state.fitMode)) },
-                    modifier = Modifier.testTag("reader-fit"),
-                ) {
-                    Text(state.fitMode.name, color = Color.White)
+                // Fit modes apply to fitted units; the Webtoon viewport has no fit modes (Task 10).
+                if (state.layout != Layout.Webtoon) {
+                    TextButton(
+                        onClick = { vm.setFitMode(nextFitMode(state.fitMode)) },
+                        modifier = Modifier.testTag("reader-fit"),
+                    ) {
+                        Text(state.fitMode.name, color = Color.White)
+                    }
                 }
             }
         }
     }
+}
+
+/**
+ * The page label on book pages: "n / total" for a one-page unit (Single, a split half, a cover or
+ * spread unit in Two-page) and "n–m / total" for a Two-page pair (spec 5.3/5.4).
+ */
+private fun pageLabel(state: ReaderState, units: List<ReaderUnit>): String {
+    val unit = units.getOrNull(state.unit)
+    return if (state.layout == Layout.TwoPage && unit != null && unit.parts.size == 2) {
+        "${unit.parts[0].page + 1}\u2013${unit.parts[1].page + 1} / ${state.count}"
+    } else {
+        "${state.page + 1} / ${state.count}"
+    }
+}
+
+/** The layout choice cycle: Auto -> Single -> TwoPage -> Webtoon -> Auto. */
+private fun nextLayoutChoice(choice: LayoutChoice): LayoutChoice = when (choice) {
+    LayoutChoice.Auto -> LayoutChoice.Single
+    LayoutChoice.Single -> LayoutChoice.TwoPage
+    LayoutChoice.TwoPage -> LayoutChoice.Webtoon
+    LayoutChoice.Webtoon -> LayoutChoice.Auto
+}
+
+/** The split choice cycle: Auto -> On -> Off -> Auto. */
+private fun nextSplitChoice(choice: SplitChoice): SplitChoice = when (choice) {
+    SplitChoice.Auto -> SplitChoice.On
+    SplitChoice.On -> SplitChoice.Off
+    SplitChoice.Off -> SplitChoice.Auto
 }
 
 private fun nextFitMode(mode: FitMode): FitMode = when (mode) {
