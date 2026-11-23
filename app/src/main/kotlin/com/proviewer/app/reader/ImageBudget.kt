@@ -2,6 +2,9 @@ package com.proviewer.app.reader
 
 import android.graphics.Bitmap
 import com.proviewer.app.engine.PageImage
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
@@ -27,6 +30,17 @@ class ImageBudget(
 ) {
     private val used = AtomicLong(0)
     private val peak = AtomicLong(0)
+
+    private val releasesInternal = MutableSharedFlow<Unit>(
+        extraBufferCapacity = 1,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST,
+    )
+
+    /**
+     * Emits after releases (conflated: a burst may arrive as one emission), so a holder whose
+     * reservation failed can retry once bytes come back. Collect on the thread that owns the retry.
+     */
+    val releases: SharedFlow<Unit> = releasesInternal
 
     /** Bytes currently reserved. */
     val usedBytes: Long get() = used.get()
@@ -54,6 +68,7 @@ class ImageBudget(
         val now = used.addAndGet(-bytes)
         check(now >= 0) { "released more bytes than were reserved" }
         onReleased?.invoke()
+        releasesInternal.tryEmit(Unit)
     }
 
     /** Restarts peak tracking from the current [usedBytes]. */

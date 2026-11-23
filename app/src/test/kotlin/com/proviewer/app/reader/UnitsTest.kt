@@ -120,4 +120,37 @@ class UnitsTest {
         val skipping = windowTargets(units, 1, 2, 1, true) { u -> if (u === units[2]) null else geometryOf(u) }
         assertEquals(listOf(1, 2, 4, 0), skipping.map { it.part.page })
     }
+    @Test
+    fun two_page_probe_failed_page_is_alone() {
+        // Page 2's size probe failed: it stands alone, so its healthy neighbours still pair and
+        // get a geometry (a failed page paired with page 1 would leave page 1 never rendered).
+        val failedSizeOf: (Int) -> IntSize? = { if (it == 2) null else sizeOf(it) }
+        val units = buildUnits(8, failedSizeOf, Layout.TwoPage, SplitChoice.Auto, Direction.Ltr, shift = false) {
+            it == 2
+        }
+        assertEquals(listOf(listOf(0), listOf(1), listOf(2), listOf(3), listOf(4), listOf(5, 6), listOf(7)), pages(units))
+        assertTrue(unitGeometry(units[1], failedSizeOf, 1000, 1000, FitMode.Screen, Direction.Ltr) != null)
+    }
+
+    @Test
+    fun rebuild_keeps_the_half_being_read() {
+        // Page 4 is wide: units 4 (left half) and 5 (right half). The reader is on the right half.
+        val before = buildUnits(8, sizeOf, Layout.Single, SplitChoice.Auto, Direction.Ltr, shift = false)
+        assertEquals(UnitPart(4, Part.RightHalf), before[5].parts.single())
+        // A size batch lands making page 1 wide too: every later index shifts by one.
+        val more: (Int) -> IntSize? = { if (it == 1) wide else sizeOf(it) }
+        val after = buildUnits(8, more, Layout.Single, SplitChoice.Auto, Direction.Ltr, shift = false)
+        val kept = unitIndexKeeping(after, before[5], page = 4)
+        assertEquals(UnitPart(4, Part.RightHalf), after[kept].parts.single())
+        assertEquals(6, kept)
+        // A direction change reorders the halves; the right half is still the one shown.
+        val rtl = buildUnits(8, sizeOf, Layout.Single, SplitChoice.Auto, Direction.Rtl, shift = false)
+        assertEquals(UnitPart(4, Part.RightHalf), rtl[unitIndexKeeping(rtl, before[5], 4)].parts.single())
+        // Split turned off: the half no longer exists, so the page's (only) unit is used.
+        val off = buildUnits(8, sizeOf, Layout.Single, SplitChoice.Off, Direction.Ltr, shift = false)
+        assertEquals(4, unitIndexKeeping(off, before[5], 4))
+        // No previous unit, or one not holding the page: the first unit of the page.
+        assertEquals(4, unitIndexKeeping(before, null, 4))
+        assertEquals(4, unitIndexKeeping(before, before[0], 4))
+    }
 }

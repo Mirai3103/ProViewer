@@ -215,6 +215,7 @@ class ReaderViewModel : ViewModel() {
         this.budget = budget
         this.window = window
         this.sizes = sizes
+        movingForward = true
         // Page sizes arrive in the background; every batch of them can change the units (split
         // decisions, pairing) and unlock more window targets.
         sizesJob = viewModelScope.launch {
@@ -277,6 +278,7 @@ class ReaderViewModel : ViewModel() {
         if (emitWebtoonCommand(WebtoonCommand.ToPage(clamped))) return
         val unit = unitIndexOf(units, clamped).coerceAtLeast(0)
         if (clamped == s.page && unit == s.unit) return
+        if (unit != s.unit) movingForward = unit > s.unit
         state = s.copy(page = clamped, unit = unit)
         scheduleWindowUpdate()
     }
@@ -294,9 +296,17 @@ class ReaderViewModel : ViewModel() {
         val s = state ?: return
         val target = units.getOrNull(unit) ?: return
         if (unit == s.unit) return
+        movingForward = unit > s.unit
         state = s.copy(unit = unit, page = target.parts.first().page)
         scheduleWindowUpdate()
     }
+
+    /**
+     * Whether the reader last moved toward later units. Units are in reading order whatever the
+     * direction (RTL only mirrors the pager), so this — not [ReaderState.direction] — says which
+     * side of the window is ahead.
+     */
+    private var movingForward = true
 
     /** The unit the pager last settled on; a test seam to await an animation's end. */
     internal var settledUnit: Int? = null
@@ -322,6 +332,7 @@ class ReaderViewModel : ViewModel() {
         val s = state ?: return
         val target = s.unit + delta
         val targetUnit = units.getOrNull(target) ?: return
+        movingForward = delta > 0
         state = s.copy(unit = target, page = targetUnit.parts.first().page)
         scheduleWindowUpdate()
     }
@@ -448,8 +459,12 @@ class ReaderViewModel : ViewModel() {
             units = emptyList()
             return
         }
-        val built = buildUnits(s.count, pageSizeLookup(), s.layout, s.split, s.direction, s.shift)
-        val unit = unitIndexOf(built, s.page).coerceAtLeast(0)
+        val built = buildUnits(s.count, pageSizeLookup(), s.layout, s.split, s.direction, s.shift) { p ->
+            sizes?.failed(p) == true
+        }
+        // Stay on the part being read (the second half of a split spread stays there when a size
+        // batch lands), not just on the first unit of the book page.
+        val unit = unitIndexKeeping(built, units.getOrNull(s.unit), s.page).coerceAtLeast(0)
         if (built != units) units = built
         if (unit != s.unit) state = s.copy(unit = unit)
         syncWebtoon()
@@ -496,7 +511,7 @@ class ReaderViewModel : ViewModel() {
             val currentUnits = units
             if (currentUnits.isEmpty()) return@launch
             val unit = s.unit.coerceIn(0, currentUnits.size - 1)
-            val forward = s.direction == Direction.Ltr
+            val forward = movingForward
             val sizeOf = pageSizeLookup()
             // The window's pages (the parts of the current unit and its neighbours), prioritized
             // so the prober lands them before the rest of the book.
@@ -508,7 +523,13 @@ class ReaderViewModel : ViewModel() {
             val targets = windowTargets(currentUnits, unit, WINDOW_AHEAD, WINDOW_BEHIND, forward) { target ->
                 unitGeometry(target, sizeOf, w, h, s.fitMode, s.direction)
             }
-            window.update(targets, PrefetchRequest(s.page, forward, w, h, s.fitMode))
+            // The engine prefetches whole pages fitted to the viewport it is given. A split half
+            // shows half the page width in the whole viewport, i.e. the whole page fitted to a
+            // viewport twice as wide: hint that while reading split halves, so the prefetched
+            // decode is sharp enough for them (the cache serves a sharper decode to a blurrier
+            // request, never the other way round).
+            val onHalf = currentUnits[unit].parts.any { it.part != Part.Whole }
+            window.update(targets, PrefetchRequest(s.page, forward, if (onHalf) w * 2 else w, h, s.fitMode))
         }
     }
 
@@ -534,7 +555,7 @@ class ReaderViewModel : ViewModel() {
                 val layout = WebtoonLayout.build(s.count, w, h, sizeOf) { p -> sizes?.failed(p) == true }
                 val session = WebtoonSession(viewModelScope, layout, webtoonTileSource ?: renderer!!, budget!!)
                 // Switching layouts keeps the book page: the column opens at that page's top.
-                session.scrollY = layout.top(s.page)
+                session.scrollY = layout.top(s.page).coerceIn(0.0, layout.maxScroll(1f))
                 webtoon = session
                 // The pager's window is closed while the session owns the tiles (its bytes return).
                 val win = window

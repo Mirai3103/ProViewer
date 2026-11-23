@@ -51,6 +51,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.isActive
@@ -58,6 +59,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import me.saket.telephoto.zoomable.DoubleClickToZoomListener
 import me.saket.telephoto.zoomable.ZoomSpec
+import me.saket.telephoto.zoomable.ZoomableContentTransformation
 import me.saket.telephoto.zoomable.ZoomableContentLocation
 import me.saket.telephoto.zoomable.ZoomableState
 import me.saket.telephoto.zoomable.rememberZoomableState
@@ -83,6 +85,12 @@ private data class TransformKey(val scale: ScaleFactor, val offset: Offset)
 private class PartDetailHost(val part: UnitPart) {
     var job: Job? = null
     var madeFor: TransformKey? = null
+
+    /**
+     * True when the last render for [madeFor] could not reserve its bytes: the budget-release
+     * retry renders it again (main-confined, like the rest of the host).
+     */
+    var starved = false
     var shown: ShownDetail? by mutableStateOf(null)
 
     /** Cancels any pending or running render and drops the shown detail, reporting it cleared. */
@@ -90,6 +98,7 @@ private class PartDetailHost(val part: UnitPart) {
         job?.cancel()
         job = null
         madeFor = null
+        starved = false
         hide(probe)
     }
 
@@ -272,6 +281,95 @@ fun ZoomableUnit(
 
     LaunchedEffect(state) {
         val effectScope = this
+
+        /**
+         * Renders the detail of every part [transformation] needs. With [onlyStarved] it is the
+         * budget retry instead: only parts whose last render for this very transformation could
+         * not reserve its bytes are tried again (nothing is cleared, nothing else re-renders).
+         */
+        fun settle(transformation: ZoomableContentTransformation, onlyStarved: Boolean) {
+            if (!transformation.isSpecified || viewport.width <= 0) return
+            val key = TransformKey(transformation.scale, transformation.offset)
+            val geometryNow = currentGeometry
+            val slotsNow = currentSlots
+            val zoom = max(transformation.scale.scaleX, transformation.scale.scaleY)
+            val topLeft = currentAlignment.align(
+                geometryNow.content,
+                viewport,
+                currentLayoutDirection,
+            )
+            val contentLeft = topLeft.x * transformation.scale.scaleX + transformation.offset.x
+            val contentTop = topLeft.y * transformation.scale.scaleY + transformation.offset.y
+
+            // The fit-scale gate: a base drawn upscaled (memory-capped) still needs a detail
+            // render at fit; otherwise, with the content filling the view, no part does.
+            fun isCapped(placement: PartPlacement): Boolean {
+                val slot = slotsNow[placement.part] as? PageSlot.Ready ?: return false
+                return slot.size.width.toLong() * slot.size.height <
+                    placement.dst.width.toLong() * placement.dst.height
+            }
+            val anyCapped = geometryNow.placements.any { isCapped(it) }
+            val contentFillsView =
+                geometryNow.content.width >= viewport.width || geometryNow.content.height >= viewport.height
+            if (zoom <= 1.001f && !anyCapped && contentFillsView) {
+                if (!onlyStarved) for (host in details.parts.values) host.clear(probe)
+                return
+            }
+
+            for (placement in geometryNow.placements) {
+                val slot = slotsNow[placement.part] as? PageSlot.Ready ?: continue
+                if (slot.image.bitmap == null) continue
+                val host = if (onlyStarved) {
+                    details.parts[placement.part]?.takeIf { it.starved && it.madeFor == key } ?: continue
+                } else {
+                    details.host(placement.part)
+                }
+                val region = visiblePartRegion(
+                    src = placement.src,
+                    dst = placement.dst,
+                    base = slot.size,
+                    zoom = zoom,
+                    contentLeft = contentLeft,
+                    contentTop = contentTop,
+                    viewW = viewport.width,
+                    viewH = viewport.height,
+                    baseCapped = isCapped(placement),
+                )
+                if (region == null) {
+                    host.clear(probe) // the base already shows everything there is
+                    continue
+                }
+                host.job?.cancel()
+                host.starved = false
+                host.madeFor = key
+                host.job = effectScope.launch {
+                    renderPartDetail(
+                        host = host,
+                        placement = placement,
+                        region = region,
+                        contentLeft = contentLeft,
+                        contentTop = contentTop,
+                        zoom = zoom,
+                        renderer = currentRenderer,
+                        budget = currentBudget,
+                        probe = probe,
+                    )
+                }
+            }
+        }
+
+        // A detail whose bytes could not be reserved retries once bytes come back (window bases
+        // evicted, tiles or other details released) instead of waiting for the next gesture.
+        launch {
+            snapshotFlow { currentBudget }.collectLatest { budgetNow ->
+                budgetNow.releases.collect {
+                    if (details.parts.values.any { it.starved }) {
+                        settle(state.contentTransformation, onlyStarved = true)
+                    }
+                }
+            }
+        }
+
         snapshotFlow { state.contentTransformation }
             .onEach { transformation ->
                 // A new transformation invalidates every detail at once: its rect no longer
@@ -285,70 +383,7 @@ fun ZoomableUnit(
                 }
             }
             .debounce(DETAIL_SETTLE_MS)
-            .collect { transformation ->
-                if (!transformation.isSpecified || viewport.width <= 0) return@collect
-                val geometryNow = currentGeometry
-                val slotsNow = currentSlots
-                val zoom = max(transformation.scale.scaleX, transformation.scale.scaleY)
-                val topLeft = currentAlignment.align(
-                    geometryNow.content,
-                    viewport,
-                    currentLayoutDirection,
-                )
-                val contentLeft = topLeft.x * transformation.scale.scaleX + transformation.offset.x
-                val contentTop = topLeft.y * transformation.scale.scaleY + transformation.offset.y
-
-                // The fit-scale gate: a base drawn upscaled (memory-capped) still needs a detail
-                // render at fit; otherwise, with the content filling the view, no part does.
-                fun isCapped(placement: PartPlacement): Boolean {
-                    val slot = slotsNow[placement.part] as? PageSlot.Ready ?: return false
-                    return slot.size.width.toLong() * slot.size.height <
-                        placement.dst.width.toLong() * placement.dst.height
-                }
-                val anyCapped = geometryNow.placements.any { isCapped(it) }
-                val contentFillsView =
-                    geometryNow.content.width >= viewport.width || geometryNow.content.height >= viewport.height
-                if (zoom <= 1.001f && !anyCapped && contentFillsView) {
-                    for (host in details.parts.values) host.clear(probe)
-                    return@collect
-                }
-
-                for (placement in geometryNow.placements) {
-                    val slot = slotsNow[placement.part] as? PageSlot.Ready ?: continue
-                    if (slot.image.bitmap == null) continue
-                    val host = details.host(placement.part)
-                    val region = visiblePartRegion(
-                        src = placement.src,
-                        dst = placement.dst,
-                        base = slot.size,
-                        zoom = zoom,
-                        contentLeft = contentLeft,
-                        contentTop = contentTop,
-                        viewW = viewport.width,
-                        viewH = viewport.height,
-                        baseCapped = isCapped(placement),
-                    )
-                    if (region == null) {
-                        host.clear(probe) // the base already shows everything there is
-                        continue
-                    }
-                    host.job?.cancel()
-                    host.madeFor = TransformKey(transformation.scale, transformation.offset)
-                    host.job = effectScope.launch {
-                        renderPartDetail(
-                            host = host,
-                            placement = placement,
-                            region = region,
-                            contentLeft = contentLeft,
-                            contentTop = contentTop,
-                            zoom = zoom,
-                            renderer = currentRenderer,
-                            budget = currentBudget,
-                            probe = probe,
-                        )
-                    }
-                }
-            }
+            .collect { transformation -> settle(transformation, onlyStarved = false) }
     }
     DisposableEffect(state) {
         onDispose { details.dispose() }
@@ -448,8 +483,12 @@ private suspend fun renderPartDetail(
     probe: ReaderProbe,
 ) {
     val bytes = rgbaBytes(region.outW, region.outH)
-    // No detail if the reservation fails; the next settle retries.
-    if (!budget.tryReserve(bytes)) return
+    // No detail if the reservation fails: the host is marked starved, and the next budget release
+    // (or the next settle) retries.
+    if (!budget.tryReserve(bytes)) {
+        host.starved = true
+        return
+    }
     var handedOver = false
     try {
         probe.onDetailRender(host.part.page, "start")

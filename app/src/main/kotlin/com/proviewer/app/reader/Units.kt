@@ -33,7 +33,9 @@ data class PartTarget(val part: UnitPart, val src: IntRect, val base: IntSize, v
  *   reading order is the left half for LTR and the right half for RTL.
  * - TwoPage: page 0 is alone unless [shift]; wide pages are alone; otherwise consecutive portrait
  *   pages pair; pairing restarts after a wide page; a trailing unpaired page is alone. [direction]
- *   does not change which pages pair, only where they are placed (see [unitGeometry]).
+ *   does not change which pages pair, only where they are placed (see [unitGeometry]). A page
+ *   whose size probe [failed] is alone too: it can never be laid out, and pairing it would leave
+ *   its healthy partner without a geometry (never rendered).
  */
 fun buildUnits(
     count: Int,
@@ -42,6 +44,7 @@ fun buildUnits(
     split: SplitChoice,
     direction: Direction,
     shift: Boolean,
+    failed: (Int) -> Boolean = { false },
 ): List<ReaderUnit> {
     val units = ArrayList<ReaderUnit>(count)
     fun whole(page: Int) = ReaderUnit(listOf(UnitPart(page, Part.Whole)))
@@ -62,7 +65,7 @@ fun buildUnits(
             }
         }
         Layout.TwoPage -> {
-            fun wide(p: Int): Boolean = sizeOf(p)?.let(::isWide) ?: false
+            fun wide(p: Int): Boolean = failed(p) || (sizeOf(p)?.let(::isWide) ?: false)
             var p = 0
             if (!shift && count > 0) {
                 units.add(whole(0))
@@ -85,6 +88,21 @@ fun buildUnits(
 /** The index of the first unit that contains [page], or -1 if none does. */
 fun unitIndexOf(units: List<ReaderUnit>, page: Int): Int =
     units.indexOfFirst { u -> u.parts.any { it.page == page } }
+
+/**
+ * The unit of rebuilt [units] to stay on while reading book [page], where [current] is the unit
+ * shown before the rebuild (null if none): the unit holding the same part of [page] that [current]
+ * showed (the reader on the second half of a split spread stays on that half, also when a
+ * direction change reorders the halves), else the first unit that contains [page]. -1 if none does.
+ */
+fun unitIndexKeeping(units: List<ReaderUnit>, current: ReaderUnit?, page: Int): Int {
+    val shownPart = current?.parts?.firstOrNull { it.page == page }
+    if (shownPart != null) {
+        val same = units.indexOfFirst { shownPart in it.parts }
+        if (same >= 0) return same
+    }
+    return unitIndexOf(units, page)
+}
 
 /** The page-pixel rectangle of [part] in a page of [size]: halves are `[0, w/2)` and `[w/2, w)`. */
 fun srcRect(part: Part, size: IntSize): IntRect = when (part) {

@@ -5,6 +5,7 @@ import com.proviewer.app.engine.PageImage
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import kotlinx.coroutines.launch
 import org.junit.Test
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.atomic.AtomicInteger
@@ -121,5 +122,19 @@ class ImageBudgetTest {
         assertTrue("max seen ${maxSeen.get()} exceeds the cap", maxSeen.get() <= cap)
         assertTrue("peak ${budget.peakBytes} exceeds the cap", budget.peakBytes <= cap)
         assertEquals(0, budget.usedBytes)
+    }
+    @Test
+    fun releases_emit_after_release() = kotlinx.coroutines.test.runTest {
+        val budget = ImageBudget(capBytes = 100)
+        assertTrue(budget.tryReserve(100))
+        assertFalse(budget.tryReserve(1))
+        val seen = AtomicInteger(0)
+        val job = launch(kotlinx.coroutines.test.UnconfinedTestDispatcher(testScheduler)) {
+            budget.releases.collect { seen.incrementAndGet() }
+        }
+        budget.release(40)
+        assertEquals(1, seen.get())
+        assertTrue(budget.tryReserve(40))
+        job.cancel()
     }
 }

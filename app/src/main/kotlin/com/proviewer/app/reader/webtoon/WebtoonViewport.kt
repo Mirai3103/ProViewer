@@ -511,8 +511,12 @@ fun WebtoonViewport(
                         val h = size.height
                         if (h <= 0) return@collect
                         cancelAnim()
+                        // One tap page is a fraction of the SCREEN, so in 1x content px it shrinks
+                        // with the zoom (otherwise a zoomed turn skips unseen content).
                         animJob.value = scope.launch {
-                            animateScrollTo(session.scrollY + command.delta * WEBTOON_PAGE_SCROLL * h)
+                            animateScrollTo(
+                                session.scrollY + command.delta * WEBTOON_PAGE_SCROLL * h / session.zoom,
+                            )
                         }
                     }
                     is WebtoonCommand.ToPage -> {
@@ -560,6 +564,12 @@ fun WebtoonViewport(
                     // same spot) never becomes the basis: the last good one stays.
                     var pinchLatched = false
                     var basis: PinchBasis? = null
+                    // A one-finger gesture becomes a drag only once it has moved past the touch
+                    // slop. Until then nothing is consumed, so the tap detector below still sees
+                    // a tap (a real finger jitters a few px between down and up).
+                    var dragging = false
+                    var slopTravel = Offset.Zero
+                    val touchSlop = viewConfiguration.touchSlop
                     while (true) {
                         val event = awaitPointerEvent()
                         val changes = event.changes
@@ -597,7 +607,11 @@ fun WebtoonViewport(
                             if (pressed.size == 1) {
                                 val change = pressed[0]
                                 val drag = change.positionChange()
-                                if (drag != Offset.Zero) {
+                                if (!dragging && !pinchLatched && drag != Offset.Zero) {
+                                    slopTravel += drag
+                                    if (slopTravel.getDistance() > touchSlop) dragging = true
+                                }
+                                if ((dragging || pinchLatched) && drag != Offset.Zero) {
                                     change.consume()
                                     if (!pinchLatched) {
                                         // Drag scrolls 1:1 (divided by the zoom); horizontal drags
@@ -611,7 +625,7 @@ fun WebtoonViewport(
                             }
                         }
                         if (pressed.isEmpty()) {
-                            if (!pinchLatched) {
+                            if (!pinchLatched && dragging) {
                                 val velocity = tracker.calculateVelocity()
                                 if (abs(velocity.y) > MIN_FLING_VELOCITY) startFling(velocity.y)
                             }
@@ -747,18 +761,27 @@ private fun DrawScope.drawWebtoon(
         }
     }
 
-    /** Whether ready tiles cover the page's visible band at [level]. */
+    // The visible 1x content x range (screen x = X*zoom - panX over [0, width]).
+    val cx0 = panX / zoom.toDouble()
+    val cx1 = cx0 + size.width / zoom.toDouble()
+
+    /** Whether ready tiles cover the page's visible area (both axes) at [level]. */
     fun coveredAt(page: Int, level: Int): Boolean {
         if (layout.isEstimated(page)) return false
         val full = fullSize(layout, page, level)
         if (full.width <= 0 || full.height <= 0) return false
         val top = layout.top(page)
         val h = layout.height(page).toDouble()
+        val scaleX = layout.viewW.toDouble() / full.width
         val scaleY = h / full.height
         for (spec in pageTiles(page, full, level)) {
             val tileTop = top + (if (spec.rect.top == 0) 0.0 else spec.rect.top * scaleY)
             val tileBottom = top + (if (spec.rect.bottom == full.height) h else spec.rect.bottom * scaleY)
             if (tileBottom <= y0 || tileTop >= y1) continue
+            // Columns outside the visible x range are never wanted while zoomed: skip them.
+            val tileLeft = if (spec.rect.left == 0) 0.0 else spec.rect.left * scaleX
+            val tileRight = if (spec.rect.right == full.width) layout.viewW.toDouble() else spec.rect.right * scaleX
+            if (tileRight <= cx0 || tileLeft >= cx1) continue
             if (tileSlots[spec.key] !is TileSlot.Ready) return false
         }
         return true

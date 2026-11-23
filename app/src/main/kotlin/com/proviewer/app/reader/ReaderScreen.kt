@@ -97,12 +97,18 @@ fun ReaderScreen(
     }
 
     // ViewModel -> pager: animate to the current unit when it changes (tap zones, volume keys,
-    // slider, layout switches, automation). Skipped when the pager is already there (a settle
-    // from a user swipe).
-    LaunchedEffect(state.unit) {
+    // slider, automation). Skipped when the pager is already there (a settle from a user swipe).
+    // When the units were rebuilt (a size batch adding splits or changing pairings before the
+    // page, a layout/split/shift/direction change) the book page did not move — only its index —
+    // so the pager snaps there instead of sliding through other units.
+    val shownUnits = remember { arrayOfNulls<List<ReaderUnit>>(1) }
+    val units = vm.units
+    LaunchedEffect(state.unit, units) {
+        val rebuilt = shownUnits[0] != null && shownUnits[0] !== units
+        shownUnits[0] = units
         if (pagerState.currentPage != state.unit) {
             userScroll.set(false) // the VM now owns the target; a leftover fling must not report
-            pagerState.animateScrollToPage(state.unit)
+            if (rebuilt) pagerState.scrollToPage(state.unit) else pagerState.animateScrollToPage(state.unit)
         }
     }
 
